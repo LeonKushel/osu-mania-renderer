@@ -171,7 +171,7 @@ class HeadlessGl:
     def __enter__(self) -> HeadlessGl:
         device_index_env = os.environ.get("R3D_EGL_DEVICE_INDEX")
         try:
-            if sys.platform == "win32":
+            if sys.platform in ("win32", "darwin"):
                 # Windows: glcontext ships ONLY the WGL module -- there is no
                 # EGL device and 'wgl' is NOT a valid backend name. Passing NO
                 # backend= lets moderngl.default_backend() select WGL. No EGL
