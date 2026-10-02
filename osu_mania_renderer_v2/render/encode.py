@@ -110,6 +110,18 @@ def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     return int(min(16_000_000.0, max(2_500_000.0, target)))
 
 
+def preview_video_bps(total_dur_s: float | None) -> int:
+    """Video bitrate of the lean preview embed. Mirrors the contributor
+    client's makeEmbedVariant (and the bot's _transcode_embed_unbounded):
+    ~1.4 Mbps, lowered on long maps so the file stays <= ~24 MiB, floor 500k.
+    Same formula as the catch engine's ``_preview_video_bps``."""
+    vbps = 1_400_000
+    if total_dur_s and total_dur_s > 0:
+        vbps = int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000
+        vbps = max(500_000, min(1_400_000, vbps))
+    return vbps
+
+
 def build_ffmpeg_cmd(
     *,
     encoder: str,
@@ -130,6 +142,7 @@ def build_ffmpeg_cmd(
     frames_fifo_path: Path | None = None,
     music_volume: float = 1.0,
     hitsound_volume: float = 1.0,
+    preview_path: Path | None = None,
 ) -> list[str]:
     """Build the ffmpeg argv. Audio is optional.
 
@@ -145,6 +158,11 @@ def build_ffmpeg_cmd(
     keeping only the per-render lead-in/volume/fade + hitsound mix. ``None``
     (kill-switch off / cache miss failure) is the unchanged fused path where
     loudnorm runs inline every render.
+
+    ``preview_path`` — INLINE PREVIEW (``R3D_PREVIEW_INLINE=1``, default OFF,
+    decided by the caller). When set, the SAME ffmpeg process also writes a
+    lean 720p30 libx264 preview there as a second output, so it is finished the
+    moment the render is. ``None`` builds the argv exactly as before.
     """
     w, h = resolution
     cmd: list[str] = [*_ffmpeg_prefix(), "-y", "-hide_banner", "-loglevel", "error"]
@@ -191,6 +209,9 @@ def build_ffmpeg_cmd(
         hit_label = None
 
     audio_out_label: str | None = None
+    # The audio filtergraph (if any). Collected here and appended below so the
+    # inline-preview path can fold it into ONE graph together with the video.
+    audio_graph: str | None = None
     if audio_path is not None:
         # `_prenorm` = we were handed a cached PCM file with rate/pitch AND
         # loudnorm already applied. In that case the rate/pitch filters and the
@@ -273,8 +294,7 @@ def build_ffmpeg_cmd(
                 "normalize=0:weights=1 1,"
                 "alimiter=limit=0.95:level=disabled:attack=1:release=20[aout]"
             )
-            filter_complex = ";".join([song_chain_str, hit_chain, mix_chain])
-            cmd += ["-filter_complex", filter_complex]
+            audio_graph = ";".join([song_chain_str, hit_chain, mix_chain])
             audio_out_label = "aout"
         else:
             sp = _song_producer("aout")
@@ -283,7 +303,7 @@ def build_ffmpeg_cmd(
                 # cached stream straight through (already loudnorm'd).
                 audio_out_label = song_label
             else:
-                cmd += ["-filter_complex", sp]
+                audio_graph = sp
                 audio_out_label = "aout"
 
     # OpenGL's framebuffer has row 0 at the BOTTOM of the viewport, but MP4
@@ -300,8 +320,9 @@ def build_ffmpeg_cmd(
         vf_chain += ["format=nv12", "hwupload"]
     else:
         vf_chain += ["scale=in_range=full:out_range=limited", "format=yuv420p"]
-    cmd += ["-vf", ",".join(vf_chain)]
 
+    # Video codec args (collected in `vc`; appended below).
+    vc: list[str] = []
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         # Resolution-scaled NVENC bitrate ladder (R3D cross-engine policy,
         # 2026-07): the flat video_bitrate (2500k default) starved 1080p60+;
@@ -309,8 +330,8 @@ def build_ffmpeg_cmd(
         # bufsize=2x. Non-NVENC encoders keep the caller's video_bitrate
         # exactly as before.
         _tgt = video_bitrate_override or nvenc_target_bps(w, h, fps)
-        cmd += ["-c:v", encoder, "-b:v", str(_tgt),
-                "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2)]
+        vc += ["-c:v", encoder, "-b:v", str(_tgt),
+               "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2)]
     elif encoder in ("h264_amf", "h264_qsv"):
         # Windows AMD (AMF) / Intel (QSV) hardware H.264. Mirror the NVENC
         # VBR ladder (target = nvenc_target_bps, maxrate 1.5x, bufsize 2x);
@@ -318,40 +339,24 @@ def build_ffmpeg_cmd(
         # hw contributor gets rate-controlled hardware encode instead of a
         # rate-control-less default. No VAAPI device on Windows.
         _tgt = video_bitrate_override or nvenc_target_bps(w, h, fps)
-        cmd += ["-c:v", encoder, "-rc", "vbr_peak", "-b:v", str(_tgt),
-                "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2)]
+        vc += ["-c:v", encoder, "-rc", "vbr_peak", "-b:v", str(_tgt),
+               "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2)]
     else:
-        cmd += ["-c:v", encoder, "-b:v",
-                (str(video_bitrate_override) if video_bitrate_override else video_bitrate)]
+        vc += ["-c:v", encoder, "-b:v",
+               (str(video_bitrate_override) if video_bitrate_override else video_bitrate)]
     # Pin BT.709 + limited-range tags on the SPS so downstream players
     # don't have to guess. (Limited range matches the scale=out_range
     # conversion above; both must agree or you get a brightness shift.)
+    color_tags: list[str] = []
     if encoder in ("h264_nvenc", "hevc_nvenc", "h264_amf", "h264_qsv",
                    "libx264", "libx265", "libopenh264"):
-        cmd += [
+        color_tags = [
             "-color_range", "tv",
             "-colorspace", "bt709",
             "-color_primaries", "bt709",
             "-color_trc", "bt709",
         ]
-
-    # +faststart moves the MP4 moov atom to the file's beginning so HTML5
-    # players (incl. Discord's inline embed) can start playback as soon as a
-    # tiny prefix has downloaded, instead of waiting on the entire file.
-    cmd += ["-movflags", "+faststart"]
-
-    if audio_path is not None:
-        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-map", "0:v"]
-        # `audio_out_label` is either a stream selector like "1:a" (use bare)
-        # or a filter-complex output label like "aout" (use [aout]).
-        if audio_out_label is None:
-            pass  # no audio mapping; fall through to video-only
-        elif ":" in audio_out_label:
-            cmd += ["-map", audio_out_label]
-        else:
-            cmd += ["-map", f"[{audio_out_label}]"]
-    else:
-        cmd += ["-map", "0:v"]
+    vc += color_tags
 
     # We want the output to be exactly the video duration (gameplay + the
     # post-game results card). With `-shortest` ffmpeg cuts to whichever
@@ -359,9 +364,119 @@ def build_ffmpeg_cmd(
     # song's audio runs out a few seconds before the video does — and once
     # ffmpeg closes stdin, the renderer hits BrokenPipeError on the next
     # frame write. `-t` bounds the output by an explicit duration instead.
+    t_args: list[str] = []
     if total_duration_ms is not None:
-        cmd += ["-t", f"{total_duration_ms / 1000:.3f}"]
+        t_args = ["-t", f"{total_duration_ms / 1000:.3f}"]
+
+    if preview_path is None:
+        if audio_graph is not None:
+            cmd += ["-filter_complex", audio_graph]
+        cmd += ["-vf", ",".join(vf_chain)]
+        cmd += vc
+
+        # +faststart moves the MP4 moov atom to the file's beginning so HTML5
+        # players (incl. Discord's inline embed) can start playback as soon as
+        # a tiny prefix has downloaded, instead of waiting on the entire file.
+        cmd += ["-movflags", "+faststart"]
+
+        if audio_path is not None:
+            cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-map", "0:v"]
+            # `audio_out_label` is either a stream selector like "1:a" (use
+            # bare) or a filter-complex output label like "aout" (use [aout]).
+            if audio_out_label is None:
+                pass  # no audio mapping; fall through to video-only
+            elif ":" in audio_out_label:
+                cmd += ["-map", audio_out_label]
+            else:
+                cmd += ["-map", f"[{audio_out_label}]"]
+        else:
+            cmd += ["-map", "0:v"]
+
+        cmd += t_args
+        cmd += [str(output_path)]
+        return cmd
+
+    # TWO OUTPUTS FROM ONE PROCESS. The frame pipe is read once; the master's
+    # own video filters (vflip + range/pixel conversion) run once, then `split`
+    # hands the SAME frames to the master encoder (unchanged settings) and to a
+    # 720p30 libx264 preview — so the preview is the right way up and in the
+    # same colours as the master. The audio graph is the master's own, then
+    # `asplit`; the preview branch gets the loudness pass the contributor
+    # client would otherwise apply before cutting its embed, so the preview
+    # needs no post-processing at all.
+    has_audio = audio_path is not None and audio_out_label is not None
+    pfps = min(30, int(round(float(fps))))
+    if encoder == "h264_vaapi":
+        # `format=nv12,hwupload` must stay on the MASTER branch only: the
+        # preview is software-encoded and cannot take VAAPI surfaces. The
+        # preview branch does the same full->limited conversion the software
+        # master path does.
+        v_pre = "vflip"
+        vm_tail = "format=nv12,hwupload"
+        vp_tail = (f"scale=-2:720:in_range=full:out_range=limited,"
+                   f"format=yuv420p,fps={pfps}")
+    else:
+        v_pre = ",".join(vf_chain)
+        vm_tail = "null"
+        vp_tail = f"scale=-2:720,fps={pfps}"
+    graph = [f"[0:v]{v_pre},split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
+             f"[vp0]{vp_tail}[vp]"]
+    if has_audio:
+        if audio_graph is not None:
+            graph.append(audio_graph)          # ...[aout], as for the master
+        else:
+            # pre-normalised song with no per-render filters ("1:a" mapped
+            # straight through): give it a label so it can be split.
+            graph.append(f"[{audio_out_label}]anull[aout]")
+        # The bare `aresample` in front of the preview's loudnorm is
+        # LOAD-BEARING: loudnorm only accepts 192 kHz / double input, and
+        # without a converter of its own on that branch ffmpeg's format
+        # negotiation pushes 192 kHz back THROUGH asplit into the shared
+        # graph — measured: a pre-normalised song + hitsound mix then ran
+        # amix at 192 kHz and the MASTER's audio came out 96 kHz instead of
+        # 48 kHz. With it, the preview branch converts for itself and the
+        # master's audio is negotiated exactly as without the preview.
+        graph.append("[aout]asplit=2[am][ap0];"
+                     f"[ap0]aresample,{LOUDNORM}[ap]")
+    cmd += ["-filter_complex", ";".join(graph)]
+
+    # output 1: the master, exactly as without the preview (same codec args,
+    # same option order; only the -map targets are the split branches).
+    cmd += vc
+    cmd += ["-movflags", "+faststart"]
+    if audio_path is not None:
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-map", "[vm]"]
+        if has_audio:
+            cmd += ["-map", "[am]"]
+    else:
+        cmd += ["-map", "[vm]"]
+    cmd += t_args
     cmd += [str(output_path)]
+
+    # output 2: the preview. libx264 on every node, deliberately: a second
+    # NVENC/VAAPI/AMF/QSV session can fail to open (session limits), and one
+    # failed output kills the whole process and with it the render.
+    vbps = preview_video_bps(
+        total_duration_ms / 1000.0 if total_duration_ms else None)
+    cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if has_audio else [])
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+            "-bufsize", str(vbps * 2), "-g", "30",
+            "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+    # Same BT.709 / limited-range tags as the master: the preview carries the
+    # same (already range-converted) pixels, so it must be labelled the same or
+    # players would render the two with different matrices.
+    cmd += ["-color_range", "tv", "-colorspace", "bt709",
+            "-color_primaries", "bt709", "-color_trc", "bt709"]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+    # Bound the preview exactly the way the master is bounded: `-t` when the
+    # duration is known, nothing otherwise. NOT `-shortest` (the catch
+    # engine's choice): here the song usually ends a few seconds before the
+    # results card does, and `-shortest` would cut the preview there while the
+    # master runs on.
+    cmd += t_args
+    cmd += ["-movflags", "+faststart", str(preview_path)]
     return cmd
 
 
