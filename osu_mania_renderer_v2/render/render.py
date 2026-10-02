@@ -490,6 +490,16 @@ async def build_render_plan(
         prenormalized_audio = await loudnorm_cache.get_or_build_normalized(
             audio_path, rate=mod_res.audio_rate, pitch=mod_res.audio_pitch)
 
+    # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
+    # that encodes the master also write the lean 720p30 preview embed as a
+    # second output, so it is finished the moment the render is. Without it the
+    # node re-encodes the finished master afterwards before anything can be
+    # published. Flag unset => the ffmpeg argv is built exactly as before.
+    preview_path: Path | None = None
+    if os.environ.get("R3D_PREVIEW_INLINE") == "1":
+        preview_path = output_path.parent / (output_path.stem + ".embed.mp4")
+        log.info("inline_preview", extra={"path": preview_path.name})
+
     cmd = build_ffmpeg_cmd(
         encoder=encoder,
         encoder_device=encoder_device,
@@ -509,6 +519,7 @@ async def build_render_plan(
         frames_fifo_path=fifo_path,
         music_volume=options.music_volume,
         hitsound_volume=options.hitsound_volume,
+        preview_path=preview_path,
     )
 
     bg_filename = modded.background_filename
