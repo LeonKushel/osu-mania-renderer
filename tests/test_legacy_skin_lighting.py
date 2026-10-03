@@ -56,6 +56,8 @@ def _renderer(*, lighting_n="missing", lighting_l="missing", argon=False, upside
     renderer._stage_light_fps = lambda _frames: 60.0
 
     renderer.normal_draws = []
+    renderer.direct_draws = []
+    renderer._draw_legacy_column_direct = lambda *args, **kw: renderer.direct_draws.append((args, kw))
     renderer.named_draws = []
     renderer.additive_draws = []
     renderer._draw_sprite_idx = lambda *args: renderer.normal_draws.append(args)
@@ -126,9 +128,11 @@ def test_custom_held_receptor_swaps_image_without_scale_bump():
     FrameRenderer._draw_receptors(renderer, _scene(held=True))
 
     # Native design height 187.5 scaled by 720/768; width stays the column.
-    assert renderer.normal_draws == [
-        (11, 100, 0, 105, 176, (1, 1, 1, 1)),
-    ]
+    assert renderer.normal_draws == []
+    assert renderer.direct_draws == [(
+        ("column/receptor_on/0", 100, 0, 105, 176),
+        {"source_bottom": 0.0, "source_top": 1.0},
+    )]
 
 
 def test_custom_upscroll_receptor_uses_native_height_at_stage_top():
@@ -136,9 +140,11 @@ def test_custom_upscroll_receptor_uses_native_height_at_stage_top():
 
     FrameRenderer._draw_receptors(renderer, _scene())
 
-    assert renderer.normal_draws == [
-        (10, 100, 720 - 176, 105, 176, (1, 1, 1, 1)),
-    ]
+    assert renderer.normal_draws == []
+    assert renderer.direct_draws == [(
+        ("column/receptor_off/0", 100, 720 - 176, 105, 176),
+        {"source_bottom": 1.0, "source_top": 0.0},
+    )]
 
 
 def test_custom_hold_lighting_uses_width_native_aspect_and_fades_in():
@@ -149,7 +155,7 @@ def test_custom_hold_lighting_uses_width_native_aspect_and_fades_in():
         lighting_l_width=(30.0,),
     )
 
-    FrameRenderer._draw_receptors(
+    FrameRenderer._draw_legacy_hit_lighting(
         renderer, _scene(held=True, press_age=40),
     )
 
@@ -166,12 +172,12 @@ def test_custom_hit_lighting_keeps_fixed_native_aspect_during_fade():
         lighting_n_width=(45.0,),
     )
 
-    FrameRenderer._draw_receptors(
+    FrameRenderer._draw_legacy_hit_lighting(
         renderer, _scene(hit_age=40, judgment="300"),
     )
     first = renderer.additive_draws[-1]
     renderer.additive_draws.clear()
-    FrameRenderer._draw_receptors(
+    FrameRenderer._draw_legacy_hit_lighting(
         renderer, _scene(hit_age=140, judgment="300"),
     )
     second = renderer.additive_draws[-1]
@@ -199,16 +205,16 @@ def test_custom_hit_position_is_not_shifted_by_argon_receptor_clamp():
     assert renderer.receptor_centre_y_gl == 648
 
 
-@pytest.mark.parametrize("source", ["user", "bundle", "missing"])
+@pytest.mark.parametrize("source", ["user", "beatmap", "bundle", "missing"])
 def test_custom_lighting_never_falls_back_to_synthetic_circle(source):
     renderer = _renderer(lighting_n=source)
 
-    FrameRenderer._draw_receptors(
+    FrameRenderer._draw_legacy_hit_lighting(
         renderer, _scene(hit_age=100, judgment="300"),
     )
 
     assert all(draw[0] != "note_circle" for draw in renderer.named_draws)
-    if source == "user":
+    if source in ("user", "beatmap"):
         assert len(renderer.additive_draws) == 1
         # Authored colour is preserved: no judgement-result RGB tint.
         assert renderer.additive_draws[0][-1][:3] == (1.0, 1.0, 1.0)

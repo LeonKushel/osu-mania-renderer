@@ -34,6 +34,10 @@ from osu_mania_renderer_v2.gpu.readback import FrameReader
 from osu_mania_renderer_v2.gpu.renderer import (
     FrameRenderer,
     RenderContext,
+)
+from osu_mania_renderer_v2.gpu.hit_error_meter import (
+    hit_error_chevron_position,
+    next_hit_error_chevron_transition,
     next_hit_error_ema,
 )
 from osu_mania_renderer_v2.beatmap.judgments import (
@@ -51,7 +55,9 @@ from osu_mania_renderer_v2.beatmap.mods import apply_mods, mod_acronyms
 from osu_mania_renderer_v2.render.hitsounds import build_hitsound_track
 from osu_mania_renderer_v2.beatmap.pp import compute_pp, compute_star_rating
 from osu_mania_renderer_v2.beatmap.replay import parse_replay
-from osu_mania_renderer_v2.render.scene import HitErrorEvent, JudgmentPopup, snapshot
+from osu_mania_renderer_v2.render.scene import (
+    HitErrorEvent, HoldVisualState, JudgmentPopup, build_hold_visual_states, snapshot,
+)
 
 log = logging.getLogger("osu_mania_renderer_v2")
 
@@ -189,6 +195,7 @@ class RenderPlan:
     # scaling carried in score_scale.
     score_scale: float = 1.0
     score_final: int | None = None
+    hold_visual_states: dict[tuple[int, int], HoldVisualState] = field(default_factory=dict)
 
 
 async def build_render_plan(
@@ -243,6 +250,9 @@ async def build_render_plan(
         modded.notes, replay.key_events, modded.key_count,
         overall_difficulty=getattr(modded, "overall_difficulty", None),
     )
+    # Retain actual head matches before aggregate tally reconciliation can
+    # demote them or promote unmatched events to synthetic zero-offset hits.
+    matched_head_events = judgments.events
     modded_od = getattr(modded, "overall_difficulty", None)
     hit_error_windows = (
         windows_for_od(float(modded_od))
@@ -543,6 +553,10 @@ async def build_render_plan(
     press_iters, release_iters = _key_edges_per_col(
         replay.key_events, modded.key_count,
     )
+    hold_visual_states = build_hold_visual_states(
+        modded.notes, matched_head_events, press_iters, release_iters,
+        release_window_ms=hit_error_windows[-1],
+    )
 
     return RenderPlan(
         options=options, skin_dir=skin_dir, beatmap_dir=beatmap_dir,
@@ -569,6 +583,7 @@ async def build_render_plan(
         n_scoring=_n_scoring, max_combo_portion=_max_combo_portion,
         mod_mult=_mod_mult, mania_mw=_mania_mw,
         score_scale=_score_scale, score_final=_score_final,
+        hold_visual_states=hold_visual_states,
     )
 
 
@@ -599,6 +614,7 @@ def build_frame_state(
         sv_table=plan.sv_table,
         note_times=plan.note_times,
         max_hold_dur_ms=plan.max_hold_dur_ms,
+        hold_visual_states=getattr(plan, "hold_visual_states", None),
     )
     # Active judgments use the actual effective judgment time (press time for
     # hits, scheduled time for misses), matching the score/combo fold below.
@@ -640,6 +656,7 @@ def build_frame_state(
             "offsets": [],
             "hit_error_history": [],
             "hit_error_ema": None,
+            "hit_error_chevron_transition": None,
             # Running left-to-right sum of `offsets` in append order — the
             # exact fold builtin sum() performs, so bit-identical to the
             # per-frame sum(offsets_so_far) it replaces.
@@ -665,6 +682,7 @@ def build_frame_state(
     offsets_so_far = _fsc["offsets"]
     hit_error_history = _fsc["hit_error_history"]
     hit_error_ema = _fsc["hit_error_ema"]
+    hit_error_transition = _fsc["hit_error_chevron_transition"]
     _offsets_sum = _fsc["offsets_sum"]
     combo_at_t = _fsc["combo"]
     last_combo_change_t = _fsc["last_combo_t"]
@@ -726,11 +744,18 @@ def build_frame_state(
                 hit_error_ema = next_hit_error_ema(
                     old_ema, j.hit_offset_ms,
                 )
+                # Interrupt at the position reached at this hit's exact clock,
+                # even when a direct seek folds several hits in one call.
+                hit_error_transition = next_hit_error_chevron_transition(
+                    hit_error_transition, eff_t, hit_error_ema,
+                    plan.hit_error_windows[-1],
+                )
     _fsc["last_t"] = t_ms
     _fsc["idx"] = _idx
     _fsc["quality"] = quality_so_far
     _fsc["offsets_sum"] = _offsets_sum
     _fsc["hit_error_ema"] = hit_error_ema
+    _fsc["hit_error_chevron_transition"] = hit_error_transition
     _fsc["combo"] = combo_at_t
     _fsc["last_combo_t"] = last_combo_change_t
     _fsc["last_combo_break_t"] = last_combo_break_t
@@ -921,6 +946,7 @@ def build_frame_state(
         hit_error_events=hit_error_events,
         hit_error_windows=plan.hit_error_windows,
         hit_error_ema_ms=hit_error_ema,
+        hit_error_chevron_position=hit_error_chevron_position(hit_error_transition, t_ms),
         avg_hit_offset_ms=avg_offset,
         unstable_rate=ur,
         pp=(plan.player_pp if results_opacity > 0 else pp_live),
@@ -978,6 +1004,7 @@ async def render_mania(
                 ctx=gl.ctx, fbo=gl.fbo,
                 width=options.resolution[0], height=options.resolution[1],
                 key_count=plan.key_count,
+                replay_mods=plan.replay.mods,
             )
             fr = FrameRenderer(
                 rc, options, skin_dir=skin_dir,

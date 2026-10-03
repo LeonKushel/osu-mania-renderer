@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -27,11 +27,14 @@ from osu_mania_renderer_v2.beatmap.skin_ini import (
 )
 from osu_mania_renderer_v2.gpu.atlas import (
     SpriteAtlas,
+    column_direct_name,
     column_variant,
     legacy_mod_slot_name,
 )
 from osu_mania_renderer_v2.gpu.legacy_mania import (
     LEGACY_NOTE_BODY_STRETCH,
+    LegacyHoldBodySegment,
+    legacy_clip_y_segment,
     legacy_disallow_zero_alpha_colour,
     legacy_doubled_alpha_colour,
     legacy_hold_body_frame,
@@ -44,8 +47,12 @@ from osu_mania_renderer_v2.gpu.legacy_mania import (
 from osu_mania_renderer_v2.gpu.legacy_note_geometry import (
     legacy_hold_geometry,
     legacy_note_draw_y,
+    legacy_note_height,
 )
 from osu_mania_renderer_v2.gpu.shaders import load_programs
+from osu_mania_renderer_v2.gpu.legacy_stage_geometry import (
+    LegacyStage, LegacyStageLayout, legacy_stage_layout, legacy_stage_topology,
+)
 from osu_mania_renderer_v2.gpu.text import text_to_texture
 from osu_mania_renderer_v2.render.dim import build_dim_envelope
 from osu_mania_renderer_v2.render.scene import SceneState
@@ -460,118 +467,16 @@ class ManiaStageSideGeometry:
     right_rect: tuple[float, float, float, float]
 
 
-@dataclass(frozen=True)
-class LazerHitErrorMeterGeometry:
-    """LegacySkin BarHitErrorMeter dimensions in OpenGL render pixels."""
-
-    ui_scale: float
-    left: float
-    axis_y: float
-    length: float
-    bar_thickness: float
-    judgment_width: float
-    judgment_thickness: float
-    chevron_size: float
-    centre_outer_size: float
-    centre_inner_size: float
-
-
-@dataclass(frozen=True)
-class LazerHitWindowBand:
-    judgment: str
-    window_ms: float
-    relative_length: float
-    colour: tuple[float, float, float]
-
-
-@dataclass(frozen=True)
-class LazerHitErrorTickState:
-    alpha: float
-    width_fraction: float
-
-
-# OsuColour.ForHitResult() values used by lazer's BarHitErrorMeter.
-LAZER_HIT_RESULT_COLOURS: dict[str, tuple[float, float, float]] = {
-    "geki": (0x99 / 255, 0xEE / 255, 1.0),
-    "300": (0x66 / 255, 0xCC / 255, 1.0),
-    "katu": (0xB3 / 255, 0xD9 / 255, 0x44 / 255),
-    "100": (0x88 / 255, 0xB3 / 255, 0.0),
-    "50": (1.0, 0xCC / 255, 0x22 / 255),
-}
-
-
-def lazer_hit_error_meter_geometry(
-    render_width: int,
-    render_height: int,
-) -> LazerHitErrorMeterGeometry:
-    """Scale lazer's 768-space legacy horizontal meter at bottom-centre."""
-    ui_scale = render_height / 768.0
-    length = 200.0 * ui_scale
-    return LazerHitErrorMeterGeometry(
-        ui_scale=ui_scale,
-        left=(render_width - length) / 2.0,
-        # Leave enough of LegacySkin's bottom margin for upright labels and
-        # the 14-unit judgment lines without clipping either at the screen.
-        axis_y=18.0 * ui_scale,
-        length=length,
-        bar_thickness=2.0 * ui_scale,
-        judgment_width=14.0 * ui_scale,
-        judgment_thickness=4.0 * ui_scale,
-        chevron_size=8.0 * ui_scale,
-        centre_outer_size=8.0 * ui_scale,
-        centre_inner_size=4.0 * ui_scale,
-    )
-
-
-def lazer_hit_window_bands(
-    windows: tuple[float, float, float, float, float],
-) -> tuple[LazerHitWindowBand, ...]:
-    """Return Perfect→Meh band sizes relative to the widest hit window."""
-    if len(windows) != 5 or windows[-1] <= 0:
-        return ()
-    maximum = windows[-1]
-    return tuple(
-        LazerHitWindowBand(judgment, float(window), float(window) / maximum,
-                           LAZER_HIT_RESULT_COLOURS[judgment])
-        for judgment, window in zip(
-            ("geki", "300", "katu", "100", "50"), windows, strict=True,
-        )
-    )
-
-
-def hit_error_offset_position(offset_ms: float, max_hit_window: float) -> float:
-    """Map a signed hit offset to lazer's clamped 0..1 bar position."""
-    if max_hit_window <= 0:
-        return 0.5
-    return max(0.0, min(1.0, (offset_ms / max_hit_window + 1.0) / 2.0))
-
-
-def lazer_hit_error_tick_state(age_ms: float) -> LazerHitErrorTickState:
-    """Match lazer's 100 ms OutQuint entrance and 5000 ms exit."""
-    if age_ms < 0 or age_ms >= 5100:
-        return LazerHitErrorTickState(alpha=0.0, width_fraction=0.0)
-    if age_ms < 100:
-        progress = age_ms / 100.0
-        eased = 1.0 - (1.0 - progress) ** 5  # Easing.OutQuint
-        return LazerHitErrorTickState(
-            alpha=0.6 * eased,
-            width_fraction=eased,
-        )
-    progress = (age_ms - 100.0) / 5000.0
-    return LazerHitErrorTickState(
-        alpha=0.6 * (1.0 - progress),
-        # ResizeWidthTo(0, ..., Easing.InQuint).
-        width_fraction=1.0 - progress ** 5,
-    )
-
-
-def next_hit_error_ema(old_average: float, offset_ms: float) -> float:
-    """Apply lazer's moving-average fold for one new scored hit."""
-    return old_average * 0.9 + offset_ms * 0.1
-
-
 def configure_direct_texture_sampling(name: str, texture) -> None:
     """Apply the per-slot sampling policy for full-resolution skin art."""
+    if name.startswith("column/"):
+        # Stable TextureGlSingle uses bilinear min/mag filtering for these
+        # sources. In particular, a narrow L image stretched only in X must
+        # not lose authored Y detail through isotropic atlas mip reduction.
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        texture.repeat_x = False
+        texture.repeat_y = False
+        return
     if name in ("scorebar_bg", "scorebar_colour"):
         # These semi-transparent bars may be rotated for HpBarMania. Repeating
         # their coloured V=0 edge against transparent-black V=1 pixels creates
@@ -936,6 +841,7 @@ class RenderContext:
     width: int
     height: int
     key_count: int
+    replay_mods: int = 0
 
 
 class FrameRenderer:
@@ -1018,6 +924,7 @@ class FrameRenderer:
             skin_dir=sk_dir,
             beatmap_dir=bm_dir,
             mania_section=self.mania_section,
+            replay_mods=getattr(rc, "replay_mods", 0),
             score_prefix=(self.skin_ini.score_prefix
                           if self.skin_ini is not None else "score"),
             combo_prefix=(self.skin_ini.combo_prefix
@@ -1070,7 +977,7 @@ class FrameRenderer:
         # Cached single-layer texture arrays for full-res direct-draw sprites
         # and finite animation frames — built once, reused every video frame.
         self._direct_arr_cache: dict[
-            str | tuple[str, int], moderngl.TextureArray
+            str | tuple, moderngl.TextureArray
         ] = {}
         # Presentation-only legacy hold animation caches. These are local to
         # this renderer and never modify SceneState/replay truth.
@@ -1297,10 +1204,30 @@ class FrameRenderer:
         self.col_w = tuple(col_w_list)
         self.pf_x = pf_x
         self.pf_w = x - pf_x
+        topology = legacy_stage_topology(K, section, mods=getattr(rc, "replay_mods", 0))
+        if not is_argon and len(topology.stages) > 1:
+            self.stage_layout = legacy_stage_layout(
+                K, section, render_width=rc.width, render_height=rc.height,
+                mods=getattr(rc, "replay_mods", 0),
+            )
+            # Keep global indices: only their presentation X/width changes.
+            self.col_x = self.stage_layout.column_x
+            self.col_w = self.stage_layout.column_width
+            self.pf_x = int(round(self.stage_layout.stages[0].x))
+            self.pf_w = int(round(self.stage_layout.stages[-1].right - self.pf_x))
+        else:
+            # Preserve existing single-stage and Argon positioning exactly.
+            self.stage_layout = LegacyStageLayout((LegacyStage(
+                0, 0, K, special_style=(section.special_style or 0) if section and not is_argon else 0,
+                x=self.pf_x, width=self.pf_w,
+            ),))
         # The "uniform" value HUD callers (hit error bar, key overlay)
         # use as a single column-width reference, sized at the average
         # so variable-pitch layouts still look proportional.
-        self.col_w_uniform = max(1, self.pf_w // K)
+        self.col_w_uniform = (
+            max(1, int(sum(self.col_w) // K))
+            if len(self.stage_layout.stages) > 1 else max(1, self.pf_w // K)
+        )
 
         # Y positions. osu! reference is Y-down 0..480; our GL coords
         # are Y-up 0..rc.height. Conversion: gl_y = h - osu_y * h/480.
@@ -1446,9 +1373,90 @@ class FrameRenderer:
             w=self.rc.width, h=self.rc.height, alpha=alpha,
         )
 
+    def _has_split_legacy_stages(self) -> bool:
+        layout = getattr(self, "stage_layout", None)
+        return layout is not None and len(layout.stages) > 1
+
+    def _legacy_column_variant(self, column: int) -> str:
+        if getattr(self, "stage_layout", None) is not None:
+            return {"1": "outer", "2": "inner", "S": "center"}[
+                self.stage_layout.column_kind(column)
+            ]
+        return column_variant(column, self.rc.key_count)
+
+    def _draw_split_stage_decorations(self) -> None:
+        """Shared stable per-stage chrome; never stretch a frame across the gap.
+
+        Side sprites retain their authored canvas extending outside a stage,
+        just as stable does (large authored canvases can overlap). Do not
+        invent a scissor at the gap or compress these native textures.
+        """
+        h, w = self.rc.height, self.rc.width
+        stages = self.stage_layout.stages
+        for x, width in ((0, stages[0].x), (stages[-1].right, w - stages[-1].right)):
+            if width > 0:
+                self._draw_sprite("column_bg", x, 0, width, h, (0, 0, 0, 0.55))
+        meaningful = any(
+            self.atlas.global_source(name) in ("user", "beatmap")
+            and np.prod(self.atlas.global_native_size(name)) > 100
+            for name in ("stage_left", "stage_right")
+        )
+        for stage in stages:
+            if not meaningful:
+                self._draw_sprite("column_bg", stage.x, 0, stage.width, h, (0, 0, 0, 0.55))
+            side = mania_stage_side_geometry(
+                playfield_left=stage.x, playfield_right=stage.right,
+                stage_height=float(h),
+                left_native_width=self.atlas.global_native_size("stage_left")[0],
+                right_native_width=self.atlas.global_native_size("stage_right")[0],
+            )
+            for name, rect in (("stage_left", side.left_rect), ("stage_right", side.right_rect)):
+                if self.atlas.global_source(name) in ("user", "beatmap"):
+                    self._draw_direct(name, *rect, tint=(1, 1, 1, 1))
+            if self.atlas.global_source("hit_light") in ("user", "beatmap"):
+                native_h = self.atlas.global_native_size("hit_light")[1]
+                hint_h = max(1, int(round(native_h * 0.9 * 1.6026 * h / 768.0)))
+                self._draw_sprite("hit_light", stage.x,
+                                  self.receptor_centre_y_gl - hint_h / 2,
+                                  stage.width, hint_h, (1, 1, 1, 0.9))
+
+    def _draw_split_stage_foreground(self) -> None:
+        if self.atlas.global_source("playfield_frame") not in ("user", "beatmap"):
+            return
+        native_w, native_h = self.atlas.global_native_size("playfield_frame")
+        h = self.rc.height
+        width, height = native_w * h / 480.0, native_h * h / 480.0
+        if width <= 0 or height <= 0:
+            return
+        frame = int(getattr(self, "_stage_clock_ms", 0) * 60 / 1000) % self.atlas.frame_count("playfield_frame")
+        for stage in self.stage_layout.stages:
+            self._draw_direct("playfield_frame", int(round(stage.center_x - width / 2)),
+                              int(round(h - height)) if self.upside_down else 0,
+                              int(round(width)), int(round(height)), (1, 1, 1, 1),
+                              frame_index=frame)
+
+    def _draw_split_column_lines(self) -> None:
+        section = self.mania_section
+        widths = section.column_line_width if section else ()
+        tint = legacy_doubled_alpha_colour(section.colour_column_line) if section and section.colour_column_line else (1, 1, 1, 1)
+        version = self.skin_ini.legacy_version if self.skin_ini else 1.0
+        # ColumnMania uses a native 0.740 line scale, independent of width fit.
+        scale = self.rc.height / 768.0
+        height = self.receptor_centre_y_gl if self.upside_down else self.rc.height - self.receptor_centre_y_gl
+        y = 0 if self.upside_down else self.receptor_centre_y_gl
+        for c, (x, width) in enumerate(zip(self.col_x, self.col_w)):
+            for index, edge in ((c, x), (c + 1, x + width)):
+                if index == c + 1 and version < 2.4 and c != self.rc.key_count - 1:
+                    continue
+                ref = widths[index] if index < len(widths) else 2.0
+                if ref <= 0:
+                    continue
+                ref = max(2.0, ref)
+                self._draw_sprite("column_bg", edge, y, ref * 0.740 * scale, height, tint)
+
     def _draw_stage_decorations(self, scene: SceneState | None = None) -> None:
-        """Draw the four stage-decoration sprite slots — stage_left,
-        stage_right, stage_bottom, stage_hint — that osu!mania skins use
+        """Draw the background stage-decoration slots — stage_left,
+        stage_right, stage_hint — that osu!mania skins use
         to theme the playfield (frame textures, hit-line indicators, ...).
         Parsed from `skin.ini` and resolved by the atlas; previously the
         renderer never actually painted any of them, so even skins that
@@ -1463,13 +1471,14 @@ class FrameRenderer:
         Coordinate convention:
           stage_left  : right edge at the playfield's left edge, full height
           stage_right : left edge at the playfield's right edge, full height
-          stage_bottom: horizontal strip flush with the receptor row,
-                        roughly the column-width tall
           stage_hint  : thin horizontal indicator at the receptor centre
 
         UpsideDown skins have already had `receptor_centre_y_gl` flipped
         by `_compute_geometry`, so positions tied to it automatically
         invert; left/right don't depend on orientation."""
+        if self._has_split_legacy_stages():
+            self._draw_split_stage_decorations()
+            return
         if scene is not None and self._is_argon_default():
             self._draw_argon_stage_decorations(scene)
             return
@@ -1555,11 +1564,21 @@ class FrameRenderer:
                 tint=(1, 1, 1, 1),
             )
 
-        # Stage-bottom + stage-hint are positioned RELATIVE TO THE
-        # RECEPTOR ROW, which already accounts for UpsideDown. In normal
-        # mode the receptor sits near the bottom and these draw just
-        # below it; in upside-down the receptor is near the top so they
-        # flip with it.
+        # Stable's stage hint belongs below the notes and keys.
+        rec_y = self.receptor_centre_y_gl
+        rec_h = self.col_w_uniform
+        hint_h = max(2, int(rec_h * 0.15))
+        self._draw_sprite(
+            "hit_light",
+            self.pf_x, rec_y - hint_h // 2, self.pf_w, hint_h,
+            (1, 1, 1, 1),
+        )
+
+    def _draw_legacy_stage_foreground(self) -> None:
+        """Stable's stage-bottom layer: above keys, below hit lighting."""
+        if self._has_split_legacy_stages():
+            self._draw_split_stage_foreground()
+            return
         rec_y = self.receptor_centre_y_gl
         rec_h = self.col_w_uniform
         # Stage bottom: a base panel anchored with its TOP at the receptor
@@ -1578,22 +1597,15 @@ class FrameRenderer:
         # When upside-down, mirror so the panel sits ABOVE the receptor.
         if self.upside_down:
             sb_y_gl = rec_y
-        # Atlas internal name for `mania-stage-bottom.png` is
-        # "playfield_frame" (legacy); `mania-stage-hint.png` is "hit_light".
+        # Atlas internal name for `mania-stage-bottom.png`.
         self._draw_sprite(
             "playfield_frame",
             self.pf_x, sb_y_gl, self.pf_w, sb_h,
             (1, 1, 1, 1),
         )
-        # Stage hint: thin indicator at the receptor centre.
-        hint_h = max(2, int(rec_h * 0.15))
-        self._draw_sprite(
-            "hit_light",
-            self.pf_x, rec_y - hint_h // 2, self.pf_w, hint_h,
-            (1, 1, 1, 1),
-        )
 
     def draw(self, scene: SceneState) -> None:
+        self._stage_clock_ms = scene.t_ms
         ctx = self.rc.ctx
         fbo = self.rc.fbo
         fbo.use()
@@ -1603,7 +1615,7 @@ class FrameRenderer:
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
         self._draw_background(scene)
-        # Stage decoration sprites (stage_left/right/bottom/hint) — drawn
+        # Stage background sprites (stage_left/right/hint) — drawn
         # AFTER the song background but BEFORE the column overlays so they
         # form a themed backdrop behind the playfield. Skins that ship
         # real assets (Night05's 1200x770 starfield) get their look;
@@ -1659,6 +1671,11 @@ class FrameRenderer:
         if not keys_under_notes:
             self._draw_receptors(scene)
         if not is_argon:
+            # Stable SpriteManagerAbove sorts keys (.92/.925), stage bottom
+            # (.94), LightingN/L (.98), then judgement (.998). Complete all
+            # lower layers before drawing lights that can cross columns.
+            self._draw_legacy_stage_foreground()
+            self._draw_legacy_hit_lighting(scene)
             self._draw_combo_and_judgment(scene)
         _show_hit_error_popups, show_ur_summary = self._legacy_timing_overlay_visibility()
         if (
@@ -2272,7 +2289,7 @@ class FrameRenderer:
         # py is the GL bottom-left Y of the last pill — same row for all.
         return py
 
-    def _draw_custom_legacy_judgment(self, scene: SceneState) -> None:
+    def _draw_custom_legacy_judgment(self, scene: SceneState, *, center_x: float | None = None) -> None:
         if not self.options.show_judgment or not scene.active_judgments:
             return
         judgment = scene.active_judgments[-1]
@@ -2293,7 +2310,8 @@ class FrameRenderer:
         height = max(1, int(round(
             native_height * texture_scale * animation_scale,
         )))
-        center_x = self.pf_x + self.pf_w / 2.0
+        if center_x is None:
+            center_x = self.pf_x + self.pf_w / 2.0
         center_y = self.score_popup_y_gl
         frame = legacy_judgment_frame(
             judgment.age_ms, self.atlas.frame_count(slot),
@@ -2309,11 +2327,12 @@ class FrameRenderer:
         )
 
     def _draw_custom_legacy_combo(
-        self, scene: SceneState, *, draw_combo: bool,
+        self, scene: SceneState, *, draw_combo: bool, center_x: float | None = None,
     ) -> None:
         if not draw_combo or not self.options.show_combo:
             return
-        center_x = self.pf_x + self.pf_w / 2.0
+        if center_x is None:
+            center_x = self.pf_x + self.pf_w / 2.0
         center_y = self.combo_baseline_y_gl
         texture_scale = self.rc.height / 768.0
         overlap = self.skin_ini.combo_overlap if self.skin_ini is not None else 0
@@ -2381,6 +2400,17 @@ class FrameRenderer:
     ) -> None:
         """Draw the shared Argon or custom legacy stage presentation."""
         if not self._is_argon_default():
+            if self._has_split_legacy_stages():
+                separate = self.mania_section is None or self.mania_section.separate_score is not False
+                for stage in self.stage_layout.stages:
+                    judgments = tuple(j for j in scene.active_judgments
+                                      if not separate or stage.first_column <= j.column < stage.end_column)
+                    self._draw_custom_legacy_judgment(
+                        replace(scene, active_judgments=judgments), center_x=stage.center_x,
+                    )
+                    # Stable duplicates the SAME shared combo regardless of SeparateScore.
+                    self._draw_custom_legacy_combo(scene, draw_combo=draw_combo, center_x=stage.center_x)
+                return
             self._draw_custom_legacy_judgment(scene)
             self._draw_custom_legacy_combo(scene, draw_combo=draw_combo)
             return
@@ -2445,159 +2475,14 @@ class FrameRenderer:
             )
 
     def _draw_hit_error_meter(self, scene: SceneState) -> None:
-        """Draw Argon's dual vertical or LegacySkin's horizontal meter."""
-        if self._is_argon_default():
-            from osu_mania_renderer_v2.wiki_elements.hud import _argon_hit_error
+        """Mania always uses TheAussie's shared horizontal meter, for any skin."""
+        from osu_mania_renderer_v2.gpu.hit_error_painter import HitErrorMeterPainter
 
-            _argon_hit_error(self._shared_frame_context(scene))
-        else:
-            self._draw_lazer_hit_error_meter(scene)
+        painter = getattr(self, "_hit_error_painter", None)
+        if painter is None:
+            painter = self._hit_error_painter = HitErrorMeterPainter(self)
+        painter.draw(scene)
 
-    def _draw_lazer_hit_error_meter(self, scene: SceneState) -> None:
-        """Draw lazer's compact horizontal legacy BarHitErrorMeter."""
-        geometry = lazer_hit_error_meter_geometry(
-            self.rc.width, self.rc.height,
-        )
-        bands = lazer_hit_window_bands(scene.hit_error_windows)
-        if not bands:
-            return
-
-        centre_x = geometry.left + geometry.length / 2.0
-        half_length = geometry.length / 2.0
-        axis_y = geometry.axis_y
-        bar_h = max(1, int(round(geometry.bar_thickness)))
-        bar_y = int(round(axis_y - bar_h / 2.0))
-
-        def draw_band_side(
-            side: int,
-            extent: float,
-            colour: tuple[float, float, float],
-            alpha: float = 1.0,
-        ) -> None:
-            width = max(1, int(round(extent)))
-            x = centre_x if side > 0 else centre_x - extent
-            self._draw_sprite(
-                "column_bg", int(round(x)), bar_y, width, bar_h,
-                (*colour, alpha),
-            )
-
-        # The widest (Meh) layer is solid through 80% then fades to transparent
-        # over its outer 20%, matching BarHitErrorMeter.createColourBar().
-        outer = bands[-1]
-        solid_extent = half_length * 0.8
-        for side in (-1, 1):
-            draw_band_side(side, solid_extent, outer.colour)
-            gradient_start = solid_extent
-            gradient_width = half_length * 0.2
-            slices = 8
-            for index in range(slices):
-                start = gradient_start + gradient_width * index / slices
-                end = gradient_start + gradient_width * (index + 1) / slices
-                alpha = 1.0 - (index + 0.5) / slices
-                width = max(1, int(round(end - start)))
-                x = centre_x + start if side > 0 else centre_x - end
-                self._draw_sprite(
-                    "column_bg", int(round(x)), bar_y, width, bar_h,
-                    (*outer.colour, alpha),
-                )
-
-        # Overlay successively narrower windows so the visible axis reads
-        # centre → Perfect → Great → Good → Ok → Meh on both sides.
-        for band in reversed(bands[:-1]):
-            extent = half_length * band.relative_length
-            for side in (-1, 1):
-                draw_band_side(side, extent, band.colour)
-
-        # Circle-style centre marker (8-unit outer, 4-unit darkened inner).
-        outer_size = max(1, int(round(geometry.centre_outer_size)))
-        inner_size = max(1, int(round(geometry.centre_inner_size)))
-        marker_colour = outer.colour
-        self._draw_sprite(
-            "note_circle",
-            int(round(centre_x - outer_size / 2.0)),
-            int(round(axis_y - outer_size / 2.0)),
-            outer_size, outer_size, (*marker_colour, 1.0),
-        )
-
-        # Judgment lines use their real ages, result colours and additive
-        # blending. A single additive batch avoids one GL flush per event.
-        ticks: list[tuple[int, int, int, int, tuple]] = []
-        max_window = bands[-1].window_ms
-        for event in scene.hit_error_events[-50:]:
-            state = lazer_hit_error_tick_state(event.age_ms)
-            if state.alpha <= 0 or state.width_fraction <= 0:
-                continue
-            position = hit_error_offset_position(event.offset_ms, max_window)
-            x = geometry.left + position * geometry.length
-            tick_w = max(1, int(round(geometry.judgment_thickness)))
-            tick_h = max(1, int(round(
-                geometry.judgment_width * state.width_fraction,
-            )))
-            colour = LAZER_HIT_RESULT_COLOURS.get(
-                event.judgment, (1.0, 1.0, 1.0),
-            )
-            ticks.append((
-                int(round(x - tick_w / 2.0)),
-                int(round(axis_y - tick_h / 2.0)),
-                tick_w, tick_h, (*colour, state.alpha),
-            ))
-        if ticks:
-            self._flush_sprite_batch()
-            ctx = self.rc.ctx
-            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE)
-            try:
-                for x, y, width, height, tint in ticks:
-                    self._draw_sprite(
-                        "column_bg", x, y, width, height, tint,
-                    )
-                self._flush_sprite_batch()
-            finally:
-                ctx.blend_func = (
-                    moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
-                )
-
-        inner_colour = tuple(channel * 0.7 for channel in marker_colour)
-        self._draw_sprite(
-            "note_circle",
-            int(round(centre_x - inner_size / 2.0)),
-            int(round(axis_y - inner_size / 2.0)),
-            inner_size, inner_size, (*inner_colour, 1.0),
-        )
-
-        # Lazer eases this chevron over 800 ms. The renderer carries the exact
-        # EMA and positions it once per output frame, avoiding mutable draw
-        # state while retaining the same 0.9/0.1 smoothing semantics.
-        if scene.hit_error_ema_ms is not None:
-            position = hit_error_offset_position(
-                scene.hit_error_ema_ms, max_window,
-            )
-            arrow_x = geometry.left + position * geometry.length
-            size = max(2, int(round(geometry.chevron_size)))
-            row_h = max(1, int(round(size / 4.0)))
-            arrow_bottom = axis_y + geometry.centre_outer_size / 2.0 + 2
-            for row in range(4):
-                width = max(1, int(round(size * (row + 1) / 4.0)))
-                self._draw_sprite(
-                    "column_bg",
-                    int(round(arrow_x - width / 2.0)),
-                    int(round(arrow_bottom + row * row_h)),
-                    width, row_h, (1.0, 1.0, 1.0, 0.9),
-                )
-
-        # Text is the narrow fallback for lazer's upright hare/tortoise icons.
-        label_y = int(round(
-            axis_y + geometry.judgment_width / 2.0 + 4 * geometry.ui_scale,
-        ))
-        for text, x in (("EARLY", geometry.left),
-                        ("LATE", geometry.left + geometry.length)):
-            texture, width, height = self._cached_text(
-                text, 14, (225, 225, 235, 210),
-            )
-            self._draw_external_texture(
-                texture,
-                x=int(round(x - width / 2.0)), y=label_y,
-                w=width, h=height, alpha=0.82,
-            )
 
     def _legacy_display_hp_for_scene(self, scene: SceneState) -> float:
         """Return renderer-local legacy HP presentation without mutating scene."""
@@ -3120,9 +3005,12 @@ class FrameRenderer:
 
     def _direct_texture_array(
         self, name: str, *, frame_index: int | None = None,
+        source_region: tuple[int, int] | None = None,
     ) -> moderngl.TextureArray | None:
         """Upload and cache one full-resolution direct texture source."""
         cache_key = name if frame_index is None else (name, frame_index)
+        if source_region is not None:
+            cache_key = (name, frame_index, source_region)
         arr = self._direct_arr_cache.get(cache_key)
         if arr is None:
             img = (
@@ -3132,6 +3020,17 @@ class FrameRenderer:
             )
             if img is None:
                 return None
+            if source_region is not None:
+                top, bottom = source_region
+                source = img
+                img = source.crop((0, top, source.width, bottom))
+                # A one-row gutter supports bilinear interpolation at strip
+                # seams. At a repeating image's ends it contains the opposite
+                # edge row, just as hardware Repeat would sample it.
+                if top < 0:
+                    img.paste(source.crop((0, source.height - 1, source.width, source.height)), (0, 0))
+                if bottom > source.height:
+                    img.paste(source.crop((0, 0, source.width, 1)), (0, img.height - 1))
             arr = self.rc.ctx.texture_array(
                 size=(img.width, img.height, 1), components=4, data=img.tobytes(),
             )
@@ -3145,6 +3044,12 @@ class FrameRenderer:
         source_u_end: float = 1.0,
         rotation_deg: float = 0.0,
         frame_index: int | None = None,
+        source_bottom: float = 0.0,
+        source_top: float = 1.0,
+        note_cover: bool = False,
+        repeat_x: bool | None = None,
+        repeat_y: bool | None = None,
+        source_region: tuple[int, int] | None = None,
     ) -> None:
         """Draw full-resolution skin art outside the shared 256² atlas.
 
@@ -3154,12 +3059,17 @@ class FrameRenderer:
         """
         if w <= 0 or h <= 0:
             return
-        arr = self._direct_texture_array(name, frame_index=frame_index)
+        arr = self._direct_texture_array(
+            name, frame_index=frame_index, source_region=source_region,
+        )
         if arr is None:
             return
+        if repeat_x is not None:
+            arr.repeat_x = repeat_x
+        if repeat_y is not None:
+            arr.repeat_y = repeat_y
         # Land on top of the queued batch (correct alpha order).
         self._flush_sprite_batch()
-        ctx = self.rc.ctx
         prog = self.programs["sprite"]
         sw, sh = self.rc.width, self.rc.height
         x0, x1 = (x / sw) * 2 - 1, ((x + w) / sw) * 2 - 1
@@ -3193,17 +3103,30 @@ class FrameRenderer:
             r, g, b, a = tint
         arr.use(0)
         self._set_sprite_prog_uniforms(prog, sh)
+        if note_cover:
+            prog["u_hd"].value = float(self._hd_active)
+            prog["u_fi"].value = float(self._fi_active)
+            prog["u_hd_recep"].value = self._cov_recep
+            prog["u_cov_fill"].value = self._cov_fill_px
+            prog["u_cov_grad"].value = self._cov_grad_px
+        # Fractions use GL bottom-to-top convention; reversed bounds mirror
+        # native art for upscroll without touching retained source pixels.
+        v_bottom = 1.0 - source_bottom
+        v_top = 1.0 - source_top
         verts = _EXT_QUAD_PACK(
-            bottom_left[0], bottom_left[1], 0, 1, 0, r, g, b, a,
-            bottom_right[0], bottom_right[1], source_u_end, 1, 0, r, g, b, a,
-            top_right[0], top_right[1], source_u_end, 0, 0, r, g, b, a,
-            bottom_left[0], bottom_left[1], 0, 1, 0, r, g, b, a,
-            top_right[0], top_right[1], source_u_end, 0, 0, r, g, b, a,
-            top_left[0], top_left[1], 0, 0, 0, r, g, b, a,
+            bottom_left[0], bottom_left[1], 0, v_bottom, 0, r, g, b, a,
+            bottom_right[0], bottom_right[1], source_u_end, v_bottom, 0, r, g, b, a,
+            top_right[0], top_right[1], source_u_end, v_top, 0, r, g, b, a,
+            bottom_left[0], bottom_left[1], 0, v_bottom, 0, r, g, b, a,
+            top_right[0], top_right[1], source_u_end, v_top, 0, r, g, b, a,
+            top_left[0], top_left[1], 0, v_top, 0, r, g, b, a,
         )
         vbo, vao = self._ext_quad_buffers()
         vbo.write(verts)
         vao.render(moderngl.TRIANGLES)
+        if note_cover:
+            prog["u_hd"].value = 0.0
+            prog["u_fi"].value = 0.0
 
     def _draw_direct_clipped_x(
         self,
@@ -3728,7 +3651,7 @@ class FrameRenderer:
                 r, g, b, a = legacy_doubled_alpha_colour(skin_colour)
                 colour_boost = 0.0
             else:
-                variant = column_variant(c, rc.key_count)
+                variant = self._legacy_column_variant(c)
                 if variant == "outer":
                     r, g, b, a = 0.04, 0.04, 0.09, 0.55
                 elif variant == "center":
@@ -3746,6 +3669,9 @@ class FrameRenderer:
         # ColourColumnLine tints all of them. We treat missing skin
         # values as "draw default-thin white outer borders + no inner
         # dividers", matching the renderer's pre-Phase-B look.
+        if self._has_split_legacy_stages():
+            self._draw_split_column_lines()
+            return
         line_widths = section.column_line_width if section else ()
         if section is not None and section.colour_column_line is not None:
             line_tint = legacy_doubled_alpha_colour(
@@ -3889,27 +3815,24 @@ class FrameRenderer:
         for n in scene.visible_notes:
             x0 = self.col_x[n.column]
             cw = self.col_w[n.column]
-            tint = tints[column_variant(n.column, rc.key_count)]
+            tint = tints[self._legacy_column_variant(n.column)]
             col_has_skin = use_skin_notes and self.atlas.has_skin_note(n.column)
             # Note height: native aspect of the skin's tap sprite when
-            # available, else square (cw × cw). Per ppy/osu
-            # LegacyNotePiece.cs — both axes divide by texture.width, so
-            # height = cw × (tex.h / tex.w) == cw / aspect. The sprite's
-            # scrolling-direction edge is anchored at to_screen_y(yf).
+            # available, else square. Stable/lazer scale X to this column,
+            # and Y to WidthForNoteHeightScale (or minimum column width).
+            # The scrolling-direction edge anchors at to_screen_y(yf).
             if col_has_skin:
                 note_asp = self.atlas.column_aspect("note_tap", n.column)
-                local_note_h = (
-                    max(1, int(cw / note_asp)) if note_asp > 0 else cw
-                )
+                local_note_h = self._legacy_note_height(note_asp)
             else:
                 local_note_h = cw  # circle fallback: square
             # Hold head/tail get their own aspect since the head/tail
             # sprite may differ from the tap sprite.
             if col_has_skin:
                 head_asp = self.atlas.column_aspect("note_hold_head", n.column)
-                head_h = max(1, int(cw / head_asp)) if head_asp > 0 else cw
+                head_h = self._legacy_note_height(head_asp)
                 tail_asp = self.atlas.column_aspect("note_hold_tail", n.column)
-                tail_h = max(1, int(cw / tail_asp)) if tail_asp > 0 else cw
+                tail_h = self._legacy_note_height(tail_asp)
             else:
                 head_h = cw
                 tail_h = cw
@@ -3928,66 +3851,13 @@ class FrameRenderer:
                 body_top = min(y_head, y_tail)
                 body_h = abs(y_head - y_tail)
                 if col_has_skin_hold:
-                    hold_geometry = legacy_hold_geometry(
-                        y_head,
-                        y_tail,
-                        head_h,
-                        tail_h,
-                        upside_down=upside_down,
-                    )
-                    body_top = hold_geometry.body_y
-                    body_h = hold_geometry.body_height
-                    body_base_idx = self.atlas.column_slot_index(
-                        "note_hold_body", n.column,
-                    )
-                    body_frames = self.atlas.column_frame_count(
-                        "note_hold_body", n.column,
-                    )
-                    body_idx = body_base_idx + self._legacy_hold_body_frame_index(
-                        scene, n, body_frames,
-                    )
                     head_idx = _animated_idx("note_hold_head", n.column, n.time_ms)
                     tail_idx = _animated_idx("note_hold_tail", n.column, n.time_ms)
-                    body_style = legacy_note_body_style(
-                        self.mania_section,
-                        n.column,
-                        self.skin_ini.legacy_version
-                        if self.skin_ini is not None else 1.0,
+                    self._draw_legacy_hold_note(
+                        scene, n, x0=x0, cw=cw, y_head=y_head, y_tail=y_tail,
+                        head_h=head_h, tail_h=tail_h,
+                        head_idx=head_idx, tail_idx=tail_idx,
                     )
-                    if body_style != LEGACY_NOTE_BODY_STRETCH:
-                        body_aspect = self.atlas.column_aspect(
-                            "note_hold_body", n.column,
-                        )
-                        tile_h = (
-                            max(1.0, cw / body_aspect)
-                            if body_aspect > 0 else float(cw)
-                        )
-                        for segment in legacy_hold_body_segments(
-                            body_top, body_h, tile_h, body_style,
-                        ):
-                            self._draw_sprite_idx_cropped_y(
-                                body_idx,
-                                x0,
-                                segment.y,
-                                cw,
-                                segment.height,
-                                (1, 1, 1, 1),
-                                source_bottom=segment.source_bottom,
-                                source_top=segment.source_top,
-                            )
-                    else:
-                        # Stretch/clamp is one continuous draw across the
-                        # whole body extent.
-                        self._draw_sprite_idx(body_idx, x0, body_top,
-                                              cw, body_h, (1, 1, 1, 1))
-                    # Caps retain their accepted scrolling-edge anchors. The
-                    # body spans their visual centres for lazer's half overlap.
-                    self._draw_sprite_idx(head_idx, x0,
-                                          hold_geometry.head_draw_y,
-                                          cw, head_h, (1, 1, 1, 1))
-                    self._draw_sprite_idx(tail_idx, x0,
-                                          hold_geometry.tail_draw_y,
-                                          cw, tail_h, (1, 1, 1, 1))
                 else:
                     pad = cw // 6
                     self._draw_sprite("column_bg", x0 + pad, body_top,
@@ -4051,47 +3921,181 @@ class FrameRenderer:
             self._draw_argon_receptors(scene)
             return
 
-        rc = self.rc
-        h = rc.height
-        centre_y = self.receptor_centre_y_gl
-        for c in range(rc.key_count):
-            x0 = self.col_x[c]
-            cw = self.col_w[c]
-            held = scene.keys_held[c]
-            kind = "receptor_on" if held else "receptor_off"
-            slot_idx = self.atlas.column_slot_index(kind, c)
+        for c in range(self.rc.key_count):
+            self._draw_legacy_key(c, held=scene.keys_held[c])
 
-            # LegacyKeyArea stretches the key image across the column but
-            # keeps its native DESIGN height (Texture.DisplaySize), scaled
-            # from lazer's 768-unit stage. This is important for padded
-            # receptor canvases: deriving height from the whole-canvas
-            # aspect stretches otherwise circular visible artwork. Atlas
-            # native sizes already divide @2x assets by ScaleAdjust.
-            _native_w, native_h = self.atlas.column_native_size(kind, c)
-            tex_scale = h / 768.0
-            if native_h > 0:
-                rec_h = max(1, int(round(native_h * tex_scale)))
-            else:
-                asp = self.atlas.column_aspect(kind, c)
-                rec_h = (
-                    max(1, int(cw / asp))
-                    if asp > 0
-                    else int(cw * RECEPTOR_HEIGHT_REL_COL)
-                )
-            # LegacyKeyArea is anchored to the stage edge: BottomCentre for
-            # downscroll, TopCentre for upscroll. Pressing only swaps
-            # KeyImage -> KeyImageD; it never resizes the authored key.
-            rec_y = h - rec_h if self.upside_down else 0
-            self._draw_sprite_idx(
-                slot_idx, x0, rec_y, cw, rec_h, (1, 1, 1, 1),
-            )
+    def _draw_legacy_hit_lighting(self, scene: SceneState) -> None:
+        """Draw stable's additive LightingN/L layer for all legacy columns."""
+        if self._is_argon_default():
+            return
+        for c in range(self.rc.key_count):
             self._draw_custom_legacy_lighting(
-                scene, c=c, x0=x0, cw=cw, centre_y=centre_y, held=held,
+                scene, c=c, x0=self.col_x[c], cw=self.col_w[c],
+                centre_y=self.receptor_centre_y_gl, held=scene.keys_held[c],
             )
+
+    def _draw_legacy_key(self, column: int, *, held: bool) -> None:
+        """LegacyKeyArea's X stretch, native Y, edge anchor and source swap."""
+        kind = "receptor_on" if held else "receptor_off"
+        _width, native_height = self.atlas.column_native_size(kind, column)
+        height = max(1, int(round(native_height * self.rc.height / 768.0)))
+        y = self.rc.height - height if self.upside_down else 0
+        self._draw_legacy_column_direct(
+            column_direct_name(kind, column),
+            self.col_x[column], y, self.col_w[column], height,
+            source_bottom=1.0 if self.upside_down else 0.0,
+            source_top=0.0 if self.upside_down else 1.0,
+        )
+
+    def _draw_legacy_hold_note(
+        self, scene, note, *, x0: float, cw: float,
+        y_head: float, y_tail: float, head_h: float, tail_h: float,
+        head_idx: int, tail_idx: int,
+    ) -> None:
+        """One native legacy hold authority for frozen head/body/tail masking."""
+        def to_screen_y(fraction):
+            if fraction is None:
+                return None
+            receptor = self.receptor_centre_y_gl
+            if self.upside_down:
+                return int(fraction * receptor)
+            return int(receptor + (1.0 - fraction) * (self.rc.height - receptor))
+
+        geometry = legacy_hold_geometry(
+            y_head, y_tail, head_h, tail_h, upside_down=self.upside_down,
+            body_head_y=to_screen_y(note.body_head_y_fraction),
+            clip_head_y=to_screen_y(note.hold_clip_head_y_fraction),
+        )
+        self._draw_legacy_hold_body(
+            scene, note, x0=x0, cw=cw,
+            body_y=geometry.body_y, body_height=geometry.body_height,
+            clip_min_y=geometry.clip_min_y, clip_max_y=geometry.clip_max_y,
+        )
+        tail = legacy_clip_y_segment(
+            LegacyHoldBodySegment(geometry.tail_draw_y, tail_h, 0.0, 1.0),
+            minimum_y=geometry.clip_min_y, maximum_y=geometry.clip_max_y,
+        )
+        if tail is not None:
+            if tail.y == geometry.tail_draw_y and tail.height == tail_h:
+                self._draw_sprite_idx(tail_idx, x0, tail.y, cw, tail.height, (1, 1, 1, 1))
+            else:
+                self._draw_sprite_idx_cropped_y(
+                    tail_idx, x0, tail.y, cw, tail.height, (1, 1, 1, 1),
+                    source_bottom=tail.source_bottom, source_top=tail.source_top,
+                )
+        # Stable depths: body .795 < rear .7975 < head .8. Both complete
+        # and cropped tails stay below the full, unmasked authored head.
+        self._draw_sprite_idx(head_idx, x0, geometry.head_draw_y,
+                              cw, head_h, (1, 1, 1, 1))
+
+    def _draw_legacy_hold_body(
+        self, scene, note, *, x0: float, cw: float,
+        body_y: float, body_height: float,
+        clip_min_y: float | None = None, clip_max_y: float | None = None,
+    ) -> None:
+        """Shared stable body source authority; cap geometry stays with caller."""
+        column = note.column
+        style = legacy_note_body_style(
+            self.mania_section, column,
+            self.skin_ini.legacy_version if self.skin_ini is not None else 1.0,
+        )
+        _width, native_height = self.atlas.column_native_size("note_hold_body", column)
+        tile_height = native_height * self.rc.height / 768.0
+        frame = self._legacy_hold_body_frame_index(
+            scene, note, self.atlas.column_frame_count("note_hold_body", column),
+        )
+        for segment in legacy_hold_body_segments(
+            body_y, body_height, tile_height, style, upside_down=self.upside_down,
+        ):
+            segment = legacy_clip_y_segment(
+                segment, minimum_y=clip_min_y, maximum_y=clip_max_y,
+            )
+            if segment is None:
+                continue
+            self._draw_legacy_column_direct(
+                column_direct_name("note_hold_body", column),
+                x0, segment.y, cw, segment.height,
+                frame_index=frame,
+                source_bottom=segment.source_bottom,
+                source_top=segment.source_top,
+                note_cover=True,
+                repeat_y=style != LEGACY_NOTE_BODY_STRETCH,
+            )
+
+    def _draw_legacy_column_direct(
+        self, name: str, x: float, y: float, width: float, height: float,
+        *, source_bottom: float, source_top: float,
+        frame_index: int | None = None, note_cover: bool = False,
+        repeat_y: bool = False,
+    ) -> None:
+        """Draw retained native pixels, splitting tall sources at GPU limits.
+
+        Strip uploads are lazy and cached by source/frame/row range. No source
+        downscale is needed even for authored 40000-row legacy hold bodies.
+        """
+        image = (
+            self.atlas.direct_image(name) if frame_index is None
+            else self.atlas.direct_frame_image(name, frame_index)
+        )
+        if image is None or height <= 0 or width <= 0:
+            return
+        max_size = self.rc.ctx.info["GL_MAX_TEXTURE_SIZE"]
+        kwargs = dict(
+            frame_index=frame_index, note_cover=note_cover,
+            repeat_x=repeat_y, repeat_y=repeat_y,
+        )
+        if image.height <= max_size:
+            self._draw_direct(
+                name, x, y, width, height,
+                source_bottom=source_bottom, source_top=source_top, **kwargs,
+            )
+            return
+        # Split in source space, preserving the destination slope and phase.
+        start = (1.0 - source_bottom) * image.height
+        end = (1.0 - source_top) * image.height
+        if start == end:
+            return
+        low, high = sorted((start, end))
+        core_height = max_size - 2  # room for one adjacent source row per edge
+        first = max(0, int(low) // core_height)
+        last = min((image.height - 1) // core_height, int(high) // core_height)
+        strips = range(first, last + 1)
+        if end < start:
+            strips = reversed(strips)
+        for index in strips:
+            top = index * core_height
+            bottom = min(image.height, top + core_height)
+            a, b = max(low, top), min(high, bottom)
+            if b <= a:
+                continue
+            row_bottom, row_top = (a, b) if end > start else (b, a)
+            t_bottom = (row_bottom - start) / (end - start)
+            t_top = (row_top - start) / (end - start)
+            crop_top = top - 1 if repeat_y else max(0, top - 1)
+            crop_bottom = bottom + 1 if repeat_y else min(image.height, bottom + 1)
+            crop_height = crop_bottom - crop_top
+            self._draw_direct(
+                name, x, y + height * t_bottom, width, height * (t_top - t_bottom),
+                source_bottom=1.0 - (row_bottom - crop_top) / crop_height,
+                source_top=1.0 - (row_top - crop_top) / crop_height,
+                source_region=(crop_top, crop_bottom),
+                frame_index=frame_index, note_cover=note_cover,
+                repeat_x=repeat_y,
+            )
+
+    def _legacy_note_height(self, aspect: float) -> int:
+        return legacy_note_height(
+            aspect, minimum_column_width=min(self.col_w),
+            configured_width=(
+                self.mania_section.width_for_note_height_scale
+                if self.mania_section is not None else None
+            ),
+            render_height=self.rc.height,
+        )
 
     def _legacy_lighting_rect(
         self, slot: str, *, c: int, x0: int, cw: int, centre_y: int,
-    ) -> tuple[int, int, int, int] | None:
+    ) -> tuple[float, int, int, int] | None:
         """Native-aspect rect for a custom legacy LightingN/L sprite."""
         native_w, native_h = self.atlas.global_native_size(slot)
         if native_w <= 0 or native_h <= 0:
@@ -4113,8 +4117,16 @@ class FrameRenderer:
         tex_scale = self.rc.height / 768.0
         light_w = max(1, int(round(native_w * tex_scale * scale)))
         light_h = max(1, int(round(native_h * tex_scale * scale)))
+        # Split columns retain fractional stable coordinates. Integer floor
+        # centring biases the light left, even when note/key rectangles agree.
+        # Consume the shared lane centre without changing native size or Y.
+        light_x = (
+            self.stage_layout.column_center(c) - light_w / 2.0
+            if self._has_split_legacy_stages()
+            else x0 + (cw - light_w) // 2
+        )
         return (
-            x0 + (cw - light_w) // 2,
+            light_x,
             centre_y - light_h // 2,
             light_w,
             light_h,
