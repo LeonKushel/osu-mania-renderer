@@ -510,6 +510,17 @@ async def build_render_plan(
         preview_path = output_path.parent / (output_path.stem + ".embed.mp4")
         log.info("inline_preview", extra={"path": preview_path.name})
 
+    # STREAMABLE MASTER (R3D_STREAM_MASTER=1, default OFF): see build_ffmpeg_cmd.
+    # The marker file tells the contributor client this engine honoured the
+    # flag; without it the client keeps its post-render loudness pass.
+    stream_master = os.environ.get("R3D_STREAM_MASTER") == "1"
+    if stream_master:
+        import json as _json
+        (output_path.parent / (output_path.stem + ".stream.json")).write_text(
+            _json.dumps({"schema": 1, "faststart": False,
+                         "loudnorm": "loudnorm=I=-18:TP=-1.5:LRA=11"}))
+        log.info("stream_master")
+
     cmd = build_ffmpeg_cmd(
         encoder=encoder,
         encoder_device=encoder_device,
@@ -530,6 +541,7 @@ async def build_render_plan(
         music_volume=options.music_volume,
         hitsound_volume=options.hitsound_volume,
         preview_path=preview_path,
+        stream_master=stream_master,
     )
 
     bg_filename = modded.background_filename

@@ -143,8 +143,16 @@ def build_ffmpeg_cmd(
     music_volume: float = 1.0,
     hitsound_volume: float = 1.0,
     preview_path: Path | None = None,
+    stream_master: bool = False,
 ) -> list[str]:
     """Build the ffmpeg argv. Audio is optional.
+
+    ``stream_master`` — STREAMABLE MASTER (``R3D_STREAM_MASTER=1``, default
+    OFF): no ``+faststart`` on the master (which rewrites the whole file at
+    close), so it is written front to back, and the loudness pass the
+    contributor client would run on the finished file (loudnorm on the MIXED
+    output, 48 kHz) is applied here instead. The client can then upload the
+    master while it renders.
 
     When ``frames_fifo_path`` is given, raw frames are read from that FIFO
     rather than stdin — required for the host-ffmpeg case (we route via
@@ -368,6 +376,19 @@ def build_ffmpeg_cmd(
     if total_duration_ms is not None:
         t_args = ["-t", f"{total_duration_ms / 1000:.3f}"]
 
+    _mfast = [] if stream_master else ["-movflags", "+faststart"]
+    # the master is the FINAL file in stream mode: 48 kHz, as the client's
+    # pass would have forced (loudnorm emits 192 kHz)
+    _m_ar = ["-ar", "48000"] if stream_master else []
+    if (stream_master and preview_path is None and audio_path is not None
+            and audio_out_label is not None):
+        # final loudness pass on the mixed output; `aresample` gives loudnorm
+        # its own converter (see the note in the preview branch below)
+        _src = audio_out_label
+        _ln = f"[{_src}]aresample,{LOUDNORM}[aoutn]"
+        audio_graph = (audio_graph + ";" + _ln) if audio_graph is not None else _ln
+        audio_out_label = "aoutn"
+
     if preview_path is None:
         if audio_graph is not None:
             cmd += ["-filter_complex", audio_graph]
@@ -377,10 +398,10 @@ def build_ffmpeg_cmd(
         # +faststart moves the MP4 moov atom to the file's beginning so HTML5
         # players (incl. Discord's inline embed) can start playback as soon as
         # a tiny prefix has downloaded, instead of waiting on the entire file.
-        cmd += ["-movflags", "+faststart"]
+        cmd += _mfast
 
         if audio_path is not None:
-            cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-map", "0:v"]
+            cmd += ["-c:a", "aac", "-b:a", audio_bitrate] + _m_ar + ["-map", "0:v"]
             # `audio_out_label` is either a stream selector like "1:a" (use
             # bare) or a filter-complex output label like "aout" (use [aout]).
             if audio_out_label is None:
@@ -436,16 +457,22 @@ def build_ffmpeg_cmd(
         # amix at 192 kHz and the MASTER's audio came out 96 kHz instead of
         # 48 kHz. With it, the preview branch converts for itself and the
         # master's audio is negotiated exactly as without the preview.
-        graph.append("[aout]asplit=2[am][ap0];"
-                     f"[ap0]aresample,{LOUDNORM}[ap]")
+        if stream_master:
+            # ONE loudness pass on the shared branch: the master and the
+            # preview carry the same normalised audio.
+            graph.append(f"[aout]aresample,{LOUDNORM},"
+                         "aformat=sample_rates=48000,asplit=2[am][ap]")
+        else:
+            graph.append("[aout]asplit=2[am][ap0];"
+                         f"[ap0]aresample,{LOUDNORM}[ap]")
     cmd += ["-filter_complex", ";".join(graph)]
 
     # output 1: the master, exactly as without the preview (same codec args,
     # same option order; only the -map targets are the split branches).
     cmd += vc
-    cmd += ["-movflags", "+faststart"]
+    cmd += _mfast
     if audio_path is not None:
-        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-map", "[vm]"]
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate] + _m_ar + ["-map", "[vm]"]
         if has_audio:
             cmd += ["-map", "[am]"]
     else:
