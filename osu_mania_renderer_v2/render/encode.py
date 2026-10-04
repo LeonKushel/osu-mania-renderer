@@ -122,6 +122,54 @@ def preview_video_bps(total_dur_s: float | None) -> int:
     return vbps
 
 
+def compact_wanted(total_dur_s, w, h, fps, default_factor) -> bool:
+    """Whether to write the inline Discord copy for this render.
+
+    R3D_COMPACT_INLINE=1 asks for it. The copy costs a second software encode
+    for the whole render, and it is only used when the master is too big to be
+    the Discord file itself, so R3D_COMPACT_IF_OVER_BYTES=<n> limits it to
+    renders whose master is EXPECTED to exceed n bytes: duration x bitrate,
+    with the bitrate taken from R3D_COMPACT_EXPECT_BPS (what this node's
+    masters of this kind have actually averaged, supplied by the client) or,
+    lacking that, the encoder ladder times `default_factor`. Without a limit,
+    or without a duration, the copy is always written."""
+    if os.environ.get("R3D_COMPACT_INLINE") != "1":
+        return False
+    try:
+        limit = int(os.environ.get("R3D_COMPACT_IF_OVER_BYTES", "0") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0 or not total_dur_s or total_dur_s <= 0:
+        return True
+    try:
+        bps = float(os.environ.get("R3D_COMPACT_EXPECT_BPS", "0") or 0)
+    except ValueError:
+        bps = 0.0
+    if bps <= 0:
+        bps = nvenc_target_bps(int(w), int(h), float(fps)) * default_factor
+    return total_dur_s * bps / 8.0 > 0.9 * limit
+
+
+def compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, int]":
+    """(scale_h, maxrate_bps, audio_bps, fps) for the inline Discord copy
+    (``-embed-sm.mp4``). Same plan as the contributor client's compactPlan and
+    the bot's _compact_plan at the 56 MiB node budget: 1080p60 on short plays,
+    720p60 on longer ones, 720p30 only when the budget is genuinely too small."""
+    budget_bits = 56 * 1024 * 1024 * 8
+    dur = float(total_dur_s or 0.0)
+    if dur <= 1:
+        return 1080, 8_000_000, 192_000, 60
+    total_rate = int(budget_bits / dur) or 1
+    pref = 192_000 if dur <= 240 else (128_000 if dur <= 600 else 96_000)
+    audio = min(pref, max(32_000, total_rate // 4))
+    maxrate = max(32_000, min(8_000_000, total_rate - audio))
+    if maxrate >= 3_000_000:
+        return 1080, maxrate, audio, 60
+    if maxrate >= 500_000:
+        return 720, maxrate, audio, 60
+    return 720, maxrate, audio, 30
+
+
 def build_ffmpeg_cmd(
     *,
     encoder: str,
@@ -144,6 +192,7 @@ def build_ffmpeg_cmd(
     hitsound_volume: float = 1.0,
     preview_path: Path | None = None,
     stream_master: bool = False,
+    compact_path: Path | None = None,
 ) -> list[str]:
     """Build the ffmpeg argv. Audio is optional.
 
@@ -440,8 +489,25 @@ def build_ffmpeg_cmd(
         v_pre = ",".join(vf_chain)
         vm_tail = "null"
         vp_tail = f"scale=-2:720,fps={pfps}"
-    graph = [f"[0:v]{v_pre},split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
-             f"[vp0]{vp_tail}[vp]"]
+    if compact_path is not None:
+        # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1): a third branch encoded to
+        # the compact plan, so nothing is left to encode after the render.
+        # Never upscaled past the master, never above its frame rate. On VAAPI
+        # it needs the same full->limited conversion as the preview branch.
+        c_h, c_max, c_abps, c_fps = compact_plan(
+            total_duration_ms / 1000.0 if total_duration_ms else None)
+        c_h = min(c_h, int(h))
+        c_fps = min(c_fps, int(round(float(fps))))
+        if encoder == "h264_vaapi":
+            vc_tail = (f"scale=-2:{c_h}:in_range=full:out_range=limited,"
+                       f"format=yuv420p,fps={c_fps}")
+        else:
+            vc_tail = f"scale=-2:{c_h}:flags=bilinear,fps={c_fps}"
+        graph = [f"[0:v]{v_pre},split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
+                 f"[vp0]{vp_tail}[vp];[vc0]{vc_tail}[vc]"]
+    else:
+        graph = [f"[0:v]{v_pre},split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
+                 f"[vp0]{vp_tail}[vp]"]
     if has_audio:
         if audio_graph is not None:
             graph.append(audio_graph)          # ...[aout], as for the master
@@ -457,11 +523,17 @@ def build_ffmpeg_cmd(
         # amix at 192 kHz and the MASTER's audio came out 96 kHz instead of
         # 48 kHz. With it, the preview branch converts for itself and the
         # master's audio is negotiated exactly as without the preview.
+        _ac = "[ac]" if compact_path is not None else ""
+        _an = 3 if compact_path is not None else 2
         if stream_master:
-            # ONE loudness pass on the shared branch: the master and the
-            # preview carry the same normalised audio.
+            # ONE loudness pass on the shared branch: the master, the preview
+            # (and the Discord copy) carry the same normalised audio.
             graph.append(f"[aout]aresample,{LOUDNORM},"
-                         "aformat=sample_rates=48000,asplit=2[am][ap]")
+                         f"aformat=sample_rates=48000,asplit={_an}[am][ap]{_ac}")
+        elif compact_path is not None:
+            # the Discord copy is cut from the FINAL (normalised) audio
+            graph.append("[aout]asplit=2[am][ap0];"
+                         f"[ap0]aresample,{LOUDNORM},asplit=2[ap][ac]")
         else:
             graph.append("[aout]asplit=2[am][ap0];"
                          f"[ap0]aresample,{LOUDNORM}[ap]")
@@ -504,6 +576,21 @@ def build_ffmpeg_cmd(
     # master runs on.
     cmd += t_args
     cmd += ["-movflags", "+faststart", str(preview_path)]
+    if compact_path is not None:
+        # output 3: the Discord copy. Same recipe as the node's own compact
+        # encode (libx264 veryfast crf 21 + VBV at the plan's maxrate), tagged
+        # like the master and the preview.
+        cmd += ["-map", "[vc]"] + (["-map", "[ac]"] if has_audio else [])
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-crf", "21", "-maxrate", str(c_max),
+                "-bufsize", str(max(1, c_max // 2)), "-g", str(c_fps),
+                "-threads", str(max(2, min(6, (os.cpu_count() or 4) // 2)))]
+        cmd += ["-color_range", "tv", "-colorspace", "bt709",
+                "-color_primaries", "bt709", "-color_trc", "bt709"]
+        if has_audio:
+            cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", str(c_abps)]
+        cmd += t_args
+        cmd += _mfast + [str(compact_path)]
     return cmd
 
 
