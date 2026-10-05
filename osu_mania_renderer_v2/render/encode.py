@@ -170,6 +170,36 @@ def compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, int]":
     return 720, maxrate, audio, 30
 
 
+def _preview_sink_args(preview_path) -> list:
+    """Output arguments for the inline preview.
+
+    Default: one faststart mp4 at ``preview_path`` (unchanged).
+
+    LIVE PREVIEW (R3D_PREVIEW_LIVE=1, default OFF): the same encode is written
+    as 2 s self-contained fMP4 segments plus a growing playlist in
+    ``<out stem>.live/`` (init.mp4, seg_00000.m4s ..., live.m3u8), so the
+    contributor client can upload the preview WHILE the render runs and the
+    site can play it before the render is done. No ``.embed.mp4`` is written in
+    this mode; the client stitches one from the segments (a stream copy). A
+    segment is renamed into place only when it is complete, and is listed in
+    the playlist only after that."""
+    if os.environ.get("R3D_PREVIEW_LIVE") != "1":
+        return ["-movflags", "+faststart", str(preview_path)]
+    live_dir = str(preview_path)[:-len(".embed.mp4")] + ".live"
+    os.makedirs(live_dir, exist_ok=True)
+    for _old in os.listdir(live_dir):       # a retry must not show stale segments
+        try:
+            os.remove(os.path.join(live_dir, _old))
+        except OSError:
+            pass
+    return ["-f", "hls", "-hls_time", "2", "-hls_segment_type", "fmp4",
+            "-hls_playlist_type", "event",
+            "-hls_flags", "independent_segments+temp_file",
+            "-hls_fmp4_init_filename", "init.mp4",
+            "-hls_segment_filename", os.path.join(live_dir, "seg_%05d.m4s"),
+            os.path.join(live_dir, "live.m3u8")]
+
+
 def build_ffmpeg_cmd(
     *,
     encoder: str,
@@ -575,7 +605,7 @@ def build_ffmpeg_cmd(
     # results card does, and `-shortest` would cut the preview there while the
     # master runs on.
     cmd += t_args
-    cmd += ["-movflags", "+faststart", str(preview_path)]
+    cmd += _preview_sink_args(preview_path)
     if compact_path is not None:
         # output 3: the Discord copy. Same recipe as the node's own compact
         # encode (libx264 veryfast crf 21 + VBV at the plan's maxrate), tagged
