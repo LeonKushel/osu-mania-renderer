@@ -538,12 +538,12 @@ def build_ffmpeg_cmd(
         # master path does.
         v_pre = "vflip"
         vm_tail = "format=nv12,hwupload"
-        vp_tail = (f"scale=-2:720:in_range=full:out_range=limited,"
-                   f"format=yuv420p,fps={pfps}")
+        vp_tail = (f"fps={pfps},scale=-2:720:in_range=full:out_range=limited,"
+                   f"format=yuv420p")
     else:
         v_pre = ",".join(vf_chain)
         vm_tail = "null"
-        vp_tail = f"scale=-2:720,fps={pfps}"
+        vp_tail = f"fps={pfps},scale=-2:720"
     if compact_path is not None:
         # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1): a third branch encoded to
         # the compact plan, so nothing is left to encode after the render.
@@ -554,10 +554,10 @@ def build_ffmpeg_cmd(
         c_h = min(c_h, int(h))
         c_fps = min(c_fps, int(round(float(fps))))
         if encoder == "h264_vaapi":
-            vc_tail = (f"scale=-2:{c_h}:in_range=full:out_range=limited,"
-                       f"format=yuv420p,fps={c_fps}")
+            vc_tail = (f"fps={c_fps},scale=-2:{c_h}:in_range=full:out_range=limited,"
+                       f"format=yuv420p")
         else:
-            vc_tail = f"scale=-2:{c_h}:flags=bilinear,fps={c_fps}"
+            vc_tail = f"fps={c_fps},scale=-2:{c_h}:flags=bilinear"
         graph = [f"[0:v]{v_pre},split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
                  f"[vp0]{vp_tail}[vp];[vc0]{vc_tail}[vc]"]
     else:
