@@ -103,10 +103,16 @@ async def probe_encoder(encoder: str, device: str | None) -> str:
 #   R3D_X264_PRESET   R3D_X264_CRF   R3D_X264_THREADS   R3D_X264_PARAMS
 # THE DEFAULTS REPRODUCE THIS ENGINE'S CURRENT COMMAND EXACTLY (a 2500k bitrate target on x264's default preset, medium):
 # with none of them set the ffmpeg argv is unchanged, argument for argument.
-_X264_PRESET = os.environ.get("R3D_X264_PRESET", "").strip()
-_X264_CRF = os.environ.get("R3D_X264_CRF", "").strip()
-_X264_THREADS = os.environ.get("R3D_X264_THREADS", "").strip()
-_X264_PARAMS = os.environ.get("R3D_X264_PARAMS", "").strip()
+#
+# Read PER RENDER, when the command is built, like R3D_STREAM_MASTER and the
+# other per-job switches: this engine also runs as a long-lived worker, and a
+# value read once at import would freeze there and silently ignore the
+# environment a later job is given.
+def _x264_knobs() -> "tuple[str, str, str, str]":
+    """(preset, crf, threads, params) from the environment as it is NOW."""
+    g = lambda k: os.environ.get(k, "").strip()
+    return (g("R3D_X264_PRESET"), g("R3D_X264_CRF"), g("R3D_X264_THREADS"),
+            g("R3D_X264_PARAMS"))
 
 
 def nvenc_target_bps(w: int, h: int, fps: float) -> int:
@@ -443,19 +449,20 @@ def build_ffmpeg_cmd(
         vc += ["-c:v", encoder, "-rc", "vbr_peak", "-b:v", str(_tgt),
                "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2)]
     else:
-        if encoder == "libx264" and _X264_CRF and not video_bitrate_override:
+        x_preset, x_crf, x_threads, x_params = _x264_knobs()
+        if encoder == "libx264" and x_crf and not video_bitrate_override:
             # constant quality instead of the flat bitrate target
-            vc += ["-c:v", encoder, "-crf", _X264_CRF]
+            vc += ["-c:v", encoder, "-crf", x_crf]
         else:
             vc += ["-c:v", encoder, "-b:v",
                    (str(video_bitrate_override) if video_bitrate_override else video_bitrate)]
         if encoder == "libx264":
-            if _X264_PRESET:
-                vc += ["-preset", _X264_PRESET]
-            if _X264_THREADS:
-                vc += ["-threads", _X264_THREADS]
-            if _X264_PARAMS:
-                vc += ["-x264-params", _X264_PARAMS]
+            if x_preset:
+                vc += ["-preset", x_preset]
+            if x_threads:
+                vc += ["-threads", x_threads]
+            if x_params:
+                vc += ["-x264-params", x_params]
     # Pin BT.709 + limited-range tags on the SPS so downstream players
     # don't have to guess. (Limited range matches the scale=out_range
     # conversion above; both must agree or you get a brightness shift.)
