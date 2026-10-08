@@ -1,8 +1,9 @@
-"""Parse osu!mania .osu files. Mania-only — std/taiko/ctb raise NotAManiaError."""
+"""Parse native Mania .osu files and opt-in standard→Mania conversion."""
 from __future__ import annotations
 
 from bisect import bisect_right as _bisect_right
 from pathlib import Path
+import re
 
 from osu_mania_renderer_v2.errors import BeatmapParseError, NotAManiaError
 from osu_mania_renderer_v2.beatmap.models import (
@@ -24,15 +25,16 @@ def parse_beatmap(
     path: Path,
     *,
     allow_converted: bool = False,
-    convert_to_keys: int = 4,
+    convert_to_keys: int | None = None,
     replay_key_events: tuple | None = None,
 ) -> BeatmapInfo:
     """Parse a .osu file.
 
-    When the file declares Mode != 3 (i.e. it's a standard/taiko/ctb
-    beatmap) and `allow_converted=True`, route through the mania
-    converter — that's what produces the chart the player actually saw
-    when they hit the in-game "convert to mania" toggle.
+    When the file declares Mode 0 and `allow_converted=True`, run the
+    standard→Mania converter. Other non-Mania modes are unsupported.
+    Replay-driven rendering opts in after validating a Mania replay.
+    An omitted `convert_to_keys` selects the client's automatic column count
+    from source difficulty and hitobjects; a number explicitly overrides it.
 
     When `replay_key_events` is also provided, the converter uses the
     player's actual key presses to recover osu!stable's exact column
@@ -41,9 +43,16 @@ def parse_beatmap(
     if not path.exists():
         raise FileNotFoundError(path)
     text = path.read_text(encoding="utf-8", errors="replace")
+    header = text.splitlines()[0].lstrip("\ufeff").strip() if text else ""
+    version_match = re.fullmatch(r"osu file format v([0-9]{1,9})", header)
+    format_version = max(1, int(version_match.group(1))) if version_match else 14
 
     sections = _split_sections(text)
     general = _kv(sections.get("General", ""))
+    sample_volume = _int_or_none(general.get("SampleVolume"))
+    sample_volume = 100 if sample_volume is None else sample_volume
+    custom_samples = (int(general["CustomSamples"].startswith("1"))
+                      if "CustomSamples" in general else None)
     metadata = _kv(sections.get("Metadata", ""))
     difficulty = _kv(sections.get("Difficulty", ""))
     events = sections.get("Events", "")
@@ -55,7 +64,7 @@ def parse_beatmap(
     except ValueError as e:
         raise BeatmapParseError(f"Invalid Mode={mode_str!r}") from e
     if mode != 3:
-        if not allow_converted:
+        if mode != 0 or not allow_converted:
             raise NotAManiaError(mode)
         # Converted path: turn the standard chart into a synthetic mania
         # chart and short-circuit the rest of this function. The renderer
@@ -97,7 +106,7 @@ def parse_beatmap(
             creator=metadata.get("Creator", ""),
             beatmap_id=_int_or_none(metadata.get("BeatmapID")),
             beatmapset_id=_int_or_none(metadata.get("BeatmapSetID")),
-            default_sample_set=general.get("SampleSet", "Soft"),
+            default_sample_set=general.get("SampleSet", "Normal"),
             slider_multiplier=slider_multiplier,
             overall_difficulty=overall_difficulty,
             key_count=convert_to_keys,
@@ -108,7 +117,8 @@ def parse_beatmap(
             approach_rate=approach_rate,
             total_break_time_ms=_parse_total_break_time(events),
             kiai_points=_parse_kiai_points(sections.get("TimingPoints", "")),
-        ), breaks=_parse_breaks(events))
+        ), breaks=_parse_breaks(events), source_mode=mode, format_version=format_version,
+            sample_volume=sample_volume, custom_samples=custom_samples)
 
     try:
         key_count = int(float(difficulty["CircleSize"]))
@@ -126,7 +136,7 @@ def parse_beatmap(
     notes, max_time = _parse_hit_objects(hit_objects_raw, key_count)
     notes_sorted = tuple(sorted(notes, key=lambda n: n.time_ms))
     timing_points = _parse_timing_points(sections.get("TimingPoints", ""))
-    default_sample_set = general.get("SampleSet", "Soft")
+    default_sample_set = general.get("SampleSet", "Normal")
 
     try:
         od = float(difficulty.get("OverallDifficulty", "5"))
@@ -150,6 +160,7 @@ def parse_beatmap(
         timing_points=timing_points,
         overall_difficulty=od,
         breaks=_parse_breaks(events),
+        format_version=format_version, sample_volume=sample_volume, custom_samples=custom_samples,
     )
 
 
@@ -273,15 +284,18 @@ def _parse_timing_points(block: str) -> tuple:
         if not line or line.startswith("//"):
             continue
         parts = line.split(",")
-        if len(parts) < 8:
+        if len(parts) < 2:
             continue
         try:
             time_ms = int(float(parts[0]))
             beat_length = float(parts[1])
-            sample_set = int(parts[3])
-            custom_index = int(parts[4])
-            volume = int(parts[5])
-            uninherited = parts[6].strip() == "1"
+            sample_set = int(parts[3]) if len(parts) >= 4 else 0
+            custom_index = int(parts[4]) if len(parts) >= 5 else 0
+            volume = int(parts[5]) if len(parts) >= 6 else 100
+            uninherited = parts[6].strip() == "1" if len(parts) >= 7 else True
+            time_signature = int(parts[2]) if len(parts) >= 3 else 4
+            if time_signature == 0:
+                time_signature = 4
         except ValueError:
             continue
         beat_length_ms = 500.0
@@ -303,6 +317,10 @@ def _parse_timing_points(block: str) -> tuple:
             custom_index=custom_index, volume=volume,
             sv_multiplier=sv_multiplier, uninherited=uninherited,
             beat_length_ms=beat_length_ms,
+            time_signature=max(1, time_signature),
+            raw_beat_length_ms=beat_length,
+            raw_time_ms=float(parts[0]),
+            field_count=len(parts),
         ))
     out.sort(key=lambda tp: tp.time_ms)
     return tuple(out)

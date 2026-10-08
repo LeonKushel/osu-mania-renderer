@@ -304,7 +304,7 @@ async def render(
     default_skin_dir: Path,
     progress_callback=None,
     allow_converted: bool = False,
-    convert_to_keys: int = 4,
+    convert_to_keys: int | None = None,
 ) -> None:
     """Wiki-driven render. Reuses the proven gameplay/setup core
     (`build_render_plan` + `build_frame_state`) and the GPU engine
@@ -354,7 +354,8 @@ async def render(
                 replay_mods=plan.replay.mods,
             )
             fr = FrameRenderer(
-                rc, options, skin_dir=skin_dir, beatmap_dir=beatmap_dir,
+                rc, options, skin_dir=skin_dir,
+                beatmap_dir=beatmap_dir if plan.modded.source_mode == 3 else None,
                 first_note_ms=plan.first_note_ms,
                 # bg dim envelope inputs (dim.py): modded-time note starts +
                 # break periods, and the scroll-speed-scaled approach window.
@@ -363,6 +364,7 @@ async def render(
                 approach_ms=plan.effective_approach_ms,
                 # break overlay clock: real/video time -> map time
                 rate=plan.audio_rate,
+                timing_points=plan.timing_points,
             )
             if plan.bg_path and plan.bg_path.exists():
                 fr.set_background(plan.bg_path)
@@ -484,8 +486,11 @@ def _build_wiki_parser() -> argparse.ArgumentParser:
                    help="override the auto resolution-scaled bitrate, e.g. "
                         "16M / 24M / 30000k. Default: the built-in ladder.")
     p.add_argument("--timeout", type=int, default=0)
-    p.add_argument("--allow-converted", action="store_true")
-    p.add_argument("--convert-to-keys", type=int, default=4)
+    p.add_argument("--allow-converted", action="store_true",
+                   help="compatibility flag; Mania replays over standard maps convert automatically")
+    p.add_argument("--convert-to-keys", type=int, default=None, choices=range(1, 11),
+                   help="explicit manual/debug conversion key count; omitted uses replay key mod "
+                        "or automatic source-derived columns")
     p.add_argument("--no-combo", action="store_true", help="hide combo counter")
     p.add_argument("--no-judgment", action="store_true",
                    help="hide hit-judgement text/sprite")

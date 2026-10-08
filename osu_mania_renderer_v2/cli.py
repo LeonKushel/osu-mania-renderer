@@ -65,7 +65,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hitsound-volume", type=int, default=None,
                    help="hitsound volume 0-100 (default: 100)")
     p.add_argument("--combo-break-threshold", type=int, default=None,
-                   help="combo at which 'break' SFX plays on miss (default: 20)")
+                   help="play break SFX when old combo exceeds N (default: 20; lazer also plays its first break)")
     p.add_argument("--audio-fade-out-ms", type=int, default=None,
                    help="end-of-song audio fade duration (default: 600)")
     p.add_argument("--no-hp-bar",       action="store_true", help="hide HP bar")
@@ -122,11 +122,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--watermark",       default=None,
                    help="text shown bottom-right (default: empty)")
     p.add_argument("--allow-converted", action="store_true",
-                   help="render standard/taiko/ctb beatmaps by converting "
-                        "to mania (rough reproduction of in-game converter)")
-    p.add_argument("--convert-to-keys", type=int, default=4,
-                   choices=[4, 5, 6, 7, 8, 9, 10],
-                   help="target keycount when converting (default 4)")
+                   help="compatibility flag; Mania replays over standard maps convert automatically")
+    p.add_argument("--convert-to-keys", type=int, default=None,
+                   choices=range(1, 11),
+                   help="explicit manual/debug conversion key count; omitted uses replay key mod "
+                        "or automatic source-derived columns")
     p.add_argument("--verbose", action="store_true")
     return p
 

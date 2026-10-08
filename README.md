@@ -30,8 +30,10 @@ service restart. Production runs on the `mania-v3` branch.
     rather than guess. This path **requires** `--skin-dir`. Still under active
     development (verify current prod path — the env toggle defaults to the GPU
     renderer).
-- The authoritative classic stage-light fallback is identified in `COPYRIGHT`
-  and retains its CC BY-NC terms; other bundled art is original or procedural.
+- Bundled `assets/classic_mania/` sprites and the classic stage-light fallback
+  are official osu! default resources by ppy, with separate upstream CC BY-NC
+  terms. They are not R3D-original or MIT art. `COPYRIGHT` attributes them;
+  `assets/classic_mania/provenance.json` records archive paths and byte hashes.
 - HUD: score/combo/accuracy/PP via digit sprites; HP bar, progress bar, and
   unstable-rate (UR) meter. Optional live PP counter and results card; official
   PP / star-rating can be injected with `--pp` / `--sr` (otherwise estimated via
@@ -82,16 +84,47 @@ await render_mania(
 )
 ```
 
+## Replay audio
+
+Replay hitsounds are enabled by default and require the declared `soundfile`
+runtime dependency. Missing/broken audio dependencies fail clearly. Conventional sample bank 0 skips the beatmap; bank 1 uses its base filename;
+bank 2+ uses only its numbered filename. Eligible beatmap samples fall back to
+unnumbered selected-skin samples with `--skin-hitsounds`, then bundled defaults. `--no-beatmap-hitsounds` removes beatmap files from this lookup.
+`--hitsound-volume` applies the final user gain. WAV output streams in bounded
+chunks, including overlapping samples and NC drums. Legacy audio names are
+case-insensitive, and custom paths stay within their permitted source folder.
+Before PCM decoding, each sample is checked against a 64 MiB estimate covering
+decoded frames, stereo expansion and resampling temporaries; oversized or invalid
+candidates fall back to the next source. This is separate from the 32 MiB retained
+sample cache and does not cap total process memory or overlapping sample tails.
+
+Known audio fidelity limits: client positional stereo balance and stable
+`SamplesMatchPlaybackRate` waveform changes are not implemented. Mismatched sample
+rates still use nearest-neighbour conversion without an anti-alias filter.
+Gameplay event timing and sample lookup tests do not imply exact client PCM parity.
+
+Both `--no-combo-break` and its compatibility control `--no-miss-hitsound` disable
+combo-break SFX. `--combo-break-threshold N` plays them when old combo is strictly
+greater than N (default 20). Lazer also plays its first nonzero-to-zero break,
+following its default client setting; that first-break rule is independent of N.
+Stable Relax/Autopilot paths suppress combo-break audio. Visual combo effects are
+independent of these audio controls.
+
+Set `R3D_PREVIEW_INLINE=1` to write a 720p30 `.embed.mp4` alongside the master in
+the same ffmpeg process. The preview includes the final song/hits mix; the master
+keeps its existing audio and video behavior.
+
 ## Requirements
 
 - Python **>=3.12**
 - Runtime deps (`pyproject.toml`): `moderngl>=5.10`, `osrparse>=7.0`, `Pillow>=10.0`,
-  `numpy>=2.0`
+  `numpy>=2.0`, `soundfile>=0.12` (sample decoder/WAV writer; platform wheels
+  normally bundle libsndfile, source installs may need system libsndfile)
 - `ffmpeg` on `$PATH` (libx264; VAAPI/NVENC optional for hardware encoding)
-- A working EGL/GPU stack for the headless ModernGL context
+- A working OpenGL stack: EGL on Linux, platform standalone context on Windows/macOS
 - Optional: `rosu_pp_py` for PP / star-rating estimation (imported lazily; PP/SR fall
   back to 0 with a warning if absent — not listed in `pyproject.toml`)
-- Dev extras (`.[dev]`): `pytest`, `pytest-asyncio`, `pytest-mock`, `ruff`
+- Dev extras (`.[dev]`): `pytest`, `pytest-asyncio`, `pytest-mock`, `ruff`, `build`
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
@@ -125,10 +158,10 @@ tree — recovery cruft, not part of the package. Verify before relying on eithe
 
 **AGPL-3.0-or-later** — see `LICENSE` and `COPYRIGHT` (© 2026 Cool Adults).
 
-Note: `pyproject.toml` still declares `license = "MIT"`, which contradicts
-`LICENSE`/`COPYRIGHT` — treat AGPL-3.0 as authoritative and fix the metadata (verify).
+Package metadata and bundled `LICENSE`/`COPYRIGHT` declare AGPL-3.0-or-later for
+the renderer code. Upstream resources retain their separately attributed licences.
 
 Attribution: gameplay/scoring/HUD logic ported from ppy's osu! / osu-framework (MIT);
 danser-go (GPL-3.0) was studied as a behavioural reference. Any osu! skin you supply
-carries its own license — check before redistributing. The bundled classic
-stage-light asset and its CC BY-NC provenance are listed in `COPYRIGHT`.
+carries its own license — check before redistributing. The bundled official
+classic Mania resources and their separate provenance are listed in `COPYRIGHT`.

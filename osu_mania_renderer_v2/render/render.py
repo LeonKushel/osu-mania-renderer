@@ -52,12 +52,18 @@ from osu_mania_renderer_v2.beatmap.judgments import (
     windows_for_od,
 )
 from osu_mania_renderer_v2.beatmap.models import HoldNote, KeyEvent, RenderOptions
-from osu_mania_renderer_v2.beatmap.mods import apply_mods, mod_acronyms
-from osu_mania_renderer_v2.render.hitsounds import build_hitsound_track
+from osu_mania_renderer_v2.beatmap.mods import apply_mods, legacy_conversion_key_count, mod_acronyms
+from osu_mania_renderer_v2.render.hitsounds import build_hitsound_track, require_hitsound_runtime
 from osu_mania_renderer_v2.beatmap.pp import compute_pp, compute_star_rating
 from osu_mania_renderer_v2.beatmap.replay import parse_replay
+from osu_mania_renderer_v2.render.legacy_mania_events import (
+    LegacyManiaPresentation, build_legacy_mania_presentation,
+)
+from osu_mania_renderer_v2.render.stable_mania_combo import StableComboTimeline
+from osu_mania_renderer_v2.render.lazer_mania_combo import LazerComboTimeline, build_lazer_combo_timeline
 from osu_mania_renderer_v2.render.scene import (
     HitErrorEvent, HoldVisualState, JudgmentPopup, build_hold_visual_states, snapshot,
+    sliding_colour_mix, lighting_n_events_at,
 )
 
 log = logging.getLogger("osu_mania_renderer_v2")
@@ -116,17 +122,6 @@ def mods_score_multiplier(mods: int) -> float:
 # weight (305 lazer / 300 stable), applied at use.
 _SD_ACC_WEIGHT: dict[str, int] = {"300": 300, "katu": 200, "100": 100,
                                   "50": 50, "miss": 0}
-
-# Default skin location on the host (Night05 lives here, including a
-# combobreak.wav). The renderer treats it as a fallback for samples
-# missing in the beatmap dir.
-_DEFAULT_SKIN_DIRS = (
-    Path("/var/mnt/Synology-Reddie/Mania ORDR Bot/skins/_default/_default-source"),
-    Path("/var/mnt/Synology-Reddie/Mania ORDR Bot/skins/_default-source"),
-    Path("/var/mnt/ASUStor-Samsung/R3DManiaORDRBot/skins/_default/_default-source"),
-    Path("/var/mnt/ASUStor-Samsung/R3DManiaORDRBot/skins/_default"),
-)
-
 
 @dataclass
 class RenderPlan:
@@ -197,6 +192,10 @@ class RenderPlan:
     score_scale: float = 1.0
     score_final: int | None = None
     hold_visual_states: dict[tuple[int, int], HoldVisualState] = field(default_factory=dict)
+    legacy_timing: Any = None
+    legacy_presentation: LegacyManiaPresentation = field(default_factory=LegacyManiaPresentation)
+    stable_combo_timeline: StableComboTimeline | None = None
+    lazer_combo_timeline: LazerComboTimeline | None = None
 
 
 async def build_render_plan(
@@ -207,17 +206,24 @@ async def build_render_plan(
     options: RenderOptions,
     skin_dir: Path | None = None,
     allow_converted: bool = False,
-    convert_to_keys: int = 4,
+    convert_to_keys: int | None = None,
 ) -> RenderPlan:
     """Parse + mod + judge + build all per-render data and the ffmpeg command.
     Pure of live resources (no GL/pipe); side effects limited to probing the
-    encoder and building the optional hitsound WAV."""
+    encoder and building the optional hitsound WAV. `allow_converted` remains
+    a compatibility argument; validated Mania replays enable Mode 0 conversion
+    automatically regardless of that flag."""
     replay = parse_replay(osr_path)
     osu_file = _find_osu(beatmap_dir, replay.beatmap_md5)
+    # A validated Mania replay authorises standard conversion. The parser
+    # owns source-mode eligibility (only Mode 0) and automatic source facts.
+    # Keep manual override > replay key mod > source automatic count.
+    converted_keys = (convert_to_keys if convert_to_keys is not None
+                      else legacy_conversion_key_count(replay.mods))
     beatmap = parse_beatmap(
         osu_file,
-        allow_converted=allow_converted,
-        convert_to_keys=convert_to_keys,
+        allow_converted=True,
+        convert_to_keys=converted_keys,
         # The converter uses the player's key-press events to recover the
         # original ManiaBeatmapConverter's column assignments — see
         # converter.py for the matching algorithm.
@@ -241,6 +247,7 @@ async def build_render_plan(
     # unscaled: stable-mania windows are rate-independent in real time.
     # NOTE: parse_beatmap above must keep consuming the RAW events - the
     # std->mania convert recovery matches them against raw .osu times.
+    audio_key_events = replay.key_events
     if mod_res.audio_rate != 1.0:
         replay = _dc_replace(replay, key_events=tuple(
             KeyEvent(time_ms=int(e.time_ms / mod_res.audio_rate),
@@ -254,6 +261,62 @@ async def build_render_plan(
     # Retain actual head matches before aggregate tally reconciliation can
     # demote them or promote unmatched events to synthetic zero-offset hits.
     matched_head_events = judgments.events
+    # Source presentation is immutable replay evidence. Header reconciliation
+    # below remains authoritative for scoring/HUD, never AddHitLight or LN input.
+    legacy_presentation = build_legacy_mania_presentation(
+        modded.notes, replay.key_events, modded.key_count,
+        od=beatmap.overall_difficulty, source_mode=beatmap.source_mode,
+        mods=replay.mods, rate=mod_res.audio_rate,
+        include_combo=not replay.is_lazer_replay and mod_res.audio_rate == 1,
+        include_audio=not replay.is_lazer_replay,
+    )
+    if not replay.is_lazer_replay and mod_res.audio_rate != 1:
+        # Reuse the SAME source state machine in original integer audio time.
+        # apply_mods preserves note order; share its resolved columns while
+        # keeping raw start/end times. Video rounding must not reorder a due
+        # ComboAddition and a release. Scoring/presentation rescaling stays intact.
+        audio_notes = tuple(_dc_replace(raw, column=display.column)
+                            for raw, display in zip(beatmap.notes, modded.notes))
+        audio_evidence = build_legacy_mania_presentation(
+            audio_notes, audio_key_events, modded.key_count,
+            od=beatmap.overall_difficulty, source_mode=beatmap.source_mode,
+            mods=replay.mods, rate=mod_res.audio_rate, timeline_rate=1, include_combo=True, include_audio=True,
+        )
+        legacy_presentation = _dc_replace(legacy_presentation, stable_combo_facts=tuple(
+            _dc_replace(fact, time_ms=fact.time_ms / mod_res.audio_rate)
+            for fact in audio_evidence.stable_combo_facts
+        ), sound_facts=tuple(
+            _dc_replace(fact, time_ms=fact.time_ms / mod_res.audio_rate,
+                        object_time_ms=fact.object_time_ms / mod_res.audio_rate)
+            for fact in audio_evidence.sound_facts
+        ))
+    stable_combo_timeline = (None if replay.is_lazer_replay else
+                             StableComboTimeline.build(legacy_presentation.stable_combo_facts))
+    lazer_combo_timeline = None
+    if replay.is_lazer_replay:
+        audio_notes = tuple(_dc_replace(raw, column=display.column)
+                            for raw, display in zip(beatmap.notes, modded.notes))
+        lazer_combo_timeline = build_lazer_combo_timeline(
+            audio_notes, replay.ordered_key_events or audio_key_events, modded.key_count,
+            od=beatmap.overall_difficulty, mods=replay.mods, rate=mod_res.audio_rate,
+        )
+        reconstructed_max = lazer_combo_timeline.reconstructed_max_combo
+        log.log(logging.INFO if reconstructed_max == replay.max_combo else logging.WARNING,
+                "lazer_combo_diagnostic header_max_combo=%d reconstructed_max_combo=%d matches=%s",
+                replay.max_combo, reconstructed_max, reconstructed_max == replay.max_combo, extra={
+                    "header_max_combo": replay.max_combo,
+                    "reconstructed_max_combo": reconstructed_max,
+                    "max_combo_matches": reconstructed_max == replay.max_combo,
+                })
+    if stable_combo_timeline is not None:
+        reconstructed_max = stable_combo_timeline.reconstructed_max_combo
+        log.log(logging.INFO if reconstructed_max == replay.max_combo else logging.WARNING,
+                "stable_combo_diagnostic header_max_combo=%d reconstructed_max_combo=%d matches=%s",
+                replay.max_combo, reconstructed_max, reconstructed_max == replay.max_combo, extra={
+                    "header_max_combo": replay.max_combo,
+                    "reconstructed_max_combo": reconstructed_max,
+                    "max_combo_matches": reconstructed_max == replay.max_combo,
+                })
     modded_od = getattr(modded, "overall_difficulty", None)
     hit_error_windows = (
         windows_for_od(float(modded_od))
@@ -445,39 +508,51 @@ async def build_render_plan(
     total_video_ms = results_start_ms + RESULTS_DURATION_MS
     total_frames = math.ceil(total_video_ms / 1000 * options.fps)
 
-    # Hitsound track — a temp WAV pre-mixed with one sample at every non-miss
-    # judgment's press time. Failure → song only.
+    # Hitsound track from gameplay events, mixed separately from the song.
+    # Requested audio dependency/build failures propagate to the caller.
     hitsound_wav: Path | None = None
     # ModNightcore beat overlay is AUTOMATIC when the NC mod (bit 1<<9) is on.
     _nc_mod = bool(int(getattr(replay, "mods", 0) or 0) & (1 << 9))
-    if audio_path is not None and (options.use_replay_hitsounds
-                                   or options.nightcore_hitsounds or _nc_mod):
+    audio_features_requested = options.use_replay_hitsounds or options.nightcore_hitsounds or _nc_mod
+    if audio_features_requested:
+        require_hitsound_runtime()
+    if audio_path is not None and audio_features_requested:
         skin_dirs: list[Path] = []
+        overlay_skin_dirs: list[Path] = []
         # NC-mod samples come from the SKIN, so include the user skin whenever
         # the NC overlay is active even if skin hitsounds are otherwise off.
         if ((options.use_skin_hitsounds or _nc_mod)
                 and skin_dir is not None and skin_dir.is_dir()):
-            skin_dirs.append(skin_dir)
-        skin_dirs.extend(p for p in _DEFAULT_SKIN_DIRS if p.is_dir())
-        try:
-            hitsound_wav = build_hitsound_track(
-                judgments_events=judgments.events if options.use_replay_hitsounds else (),
-                beatmap=modded,
-                beatmap_dir=beatmap_dir,
-                output_wav=output_path.with_suffix(".hits.wav"),
-                duration_ms=total_video_ms,
-                audio_rate=mod_res.audio_rate,
-                skin_dirs=tuple(skin_dirs),
-                beatmap_hitsounds=options.beatmap_hitsounds,
-                miss_hitsound=options.miss_hitsound,
-                nightcore=options.nightcore_hitsounds,
-                nc_mod=_nc_mod,
-                # beat overlays stop at gameplay end, not into results (taiko ac73af2)
-                gameplay_end_ms=float(gameplay_end_ms),
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("hitsound_build_failed", extra={"err": str(e)})
-            hitsound_wav = None
+            overlay_skin_dirs.append(skin_dir)
+            if options.use_skin_hitsounds:
+                skin_dirs.append(skin_dir)
+        hitsound_wav = build_hitsound_track(
+            judgments_events=judgments.events if options.use_replay_hitsounds else (),
+            lazer_facts=(lazer_combo_timeline.facts if options.use_replay_hitsounds else ())
+                if lazer_combo_timeline is not None else None,
+            is_lazer_replay=replay.is_lazer_replay,
+            stable_sound_facts=legacy_presentation.sound_facts if options.use_replay_hitsounds else (),
+            combo_facts=((lazer_combo_timeline or stable_combo_timeline).facts
+                         if options.use_replay_hitsounds else ()),
+            combo_break_sound=options.combo_break_sound,
+            combo_break_threshold=options.combo_break_threshold,
+            mods=replay.mods,
+            sample_notes=tuple(_dc_replace(raw, column=display.column)
+                               for raw, display in zip(beatmap.notes, modded.notes)),
+            beatmap=modded,
+            beatmap_dir=beatmap_dir,
+            output_wav=output_path.with_suffix(".hits.wav"),
+            duration_ms=total_video_ms,
+            audio_rate=mod_res.audio_rate,
+            skin_dirs=tuple(skin_dirs),
+            overlay_skin_dirs=tuple(overlay_skin_dirs),
+            beatmap_hitsounds=options.beatmap_hitsounds,
+            miss_hitsound=options.miss_hitsound,
+            nightcore=options.nightcore_hitsounds,
+            nc_mod=_nc_mod,
+            # beat overlays stop at gameplay end, not into results (taiko ac73af2)
+            gameplay_end_ms=float(gameplay_end_ms),
+        )
 
     # Host-ffmpeg FIFO path (toolbox). Otherwise plain stdin.
     fifo_path: Path | None = None
@@ -559,6 +634,12 @@ async def build_render_plan(
     bg_filename = modded.background_filename
     bg_path = (beatmap_dir / bg_filename) if bg_filename else None
     first_note_ms = min((n.time_ms for n in modded.notes), default=0)
+    from osu_mania_renderer_v2.render.legacy_mania_timing import LegacyManiaTiming
+    legacy_timing = LegacyManiaTiming.build(
+        tps, first_note_ms=first_note_ms,
+        last_note_ms=max((getattr(n, "end_time_ms", n.time_ms) for n in modded.notes), default=0),
+        scroll_speed=options.scroll_speed or SCROLL_SPEED_BASELINE, rate=mod_res.audio_rate,
+    )
     banner_text = (
         f"{modded.artist} - {modded.title} [{modded.difficulty}]   "
         f"{replay.player_name}"
@@ -608,6 +689,10 @@ async def build_render_plan(
         mod_mult=_mod_mult, mania_mw=_mania_mw,
         score_scale=_score_scale, score_final=_score_final,
         hold_visual_states=hold_visual_states,
+        legacy_timing=legacy_timing,
+        legacy_presentation=legacy_presentation,
+        stable_combo_timeline=stable_combo_timeline,
+        lazer_combo_timeline=lazer_combo_timeline,
     )
 
 
@@ -640,6 +725,17 @@ def build_frame_state(
         max_hold_dur_ms=plan.max_hold_dur_ms,
         hold_visual_states=getattr(plan, "hold_visual_states", None),
     )
+    legacy_timing = getattr(plan, "legacy_timing", None)
+    legacy_scene = None
+    if legacy_timing is not None:
+        legacy_scene = snapshot(
+            notes=plan.modded.notes, key_events=replay.key_events,
+            t_ms=t_ms, key_count=key_count, approach_ms=plan.effective_approach_ms,
+            visual_mods=plan.visual_mods, consumed_times=plan.judged_hits,
+            note_times=plan.note_times, max_hold_dur_ms=plan.max_hold_dur_ms,
+            hold_visual_states=getattr(plan, "hold_visual_states", None),
+            movement_timeline=legacy_timing,
+        )
     # Active judgments use the actual effective judgment time (press time for
     # hits, scheduled time for misses), matching the score/combo fold below.
     # This also gives each new legacy animation an exact age-zero/frame-zero
@@ -841,6 +937,16 @@ def build_frame_state(
 
     combo_age_ms = t_ms - last_combo_change_t
     combo_break_age_ms = t_ms - last_combo_break_t
+    # This gameplay carrier is independent of skin choice and score combo.
+    # Keep the reconciled score fold; both clients have separate combo truth.
+    source_combo_timeline = (getattr(plan, "lazer_combo_timeline", None)
+                             or getattr(plan, "stable_combo_timeline", None))
+    source_combo_state = source_combo_timeline.at(t_ms) if source_combo_timeline is not None else None
+    if source_combo_state is not None:
+        combo_at_t = source_combo_state.combo
+        combo_age_ms = t_ms - source_combo_state.last_increment_ms
+        combo_break_previous = source_combo_state.break_previous_value
+        combo_break_age_ms = t_ms - source_combo_state.last_break_ms
 
     if gameplay_end_ms > 0:
         song_progress = min(1.0, max(0.0, t_ms / gameplay_end_ms))
@@ -871,6 +977,8 @@ def build_frame_state(
         if mt <= t_ms:
             miss_break_age = t_ms - mt
             break
+    if source_combo_state is not None:
+        miss_break_age = t_ms - source_combo_state.last_large_break_ms
 
     total_so_far = sum(running.values())
     if total_so_far == 0:
@@ -946,10 +1054,19 @@ def build_frame_state(
     else:
         fade = 0.0
     fade = max(0.0, min(1.0, fade))
+    presentation = getattr(plan, "legacy_presentation", LegacyManiaPresentation())
     scene_full = scene.__class__(
         t_ms=scene.t_ms, visible_notes=scene.visible_notes,
         keys_held=scene.keys_held, visual_mods=scene.visual_mods,
         active_judgments=active,
+        legacy_timing=legacy_timing,
+        legacy_visible_notes=legacy_scene.visible_notes if legacy_scene else None,
+        lighting_n_events=lighting_n_events_at(presentation.normal_hit_facts,
+                                              presentation.normal_hit_times, t_ms, presentation.rate),
+        legacy_hold_colour_mix=sliding_colour_mix(presentation.sliding_intervals, t_ms),
+        legacy_long_lights=presentation.long_lights_at(t_ms),
+        hold_light_press_age_ms=scene.hold_light_press_age_ms,
+        hold_light_release_age_ms=scene.hold_light_release_age_ms,
         score=(plan.score_final
                if (results_opacity > 0 and plan.score_final is not None)
                else score_so_far),
@@ -983,6 +1100,7 @@ def build_frame_state(
         combo_age_ms=combo_age_ms,
         combo_break_previous_value=combo_break_previous,
         combo_break_age_ms=combo_break_age_ms,
+        reconstructed_max_combo=source_combo_state.running_max if source_combo_state is not None else None,
         score_smoothed=int(score_smoothed),
         accuracy_smoothed=accuracy_smoothed,
         song_progress=song_progress,
@@ -1007,7 +1125,7 @@ async def render_mania(
     log_path: Path | None = None,
     skin_dir: Path | None = None,
     allow_converted: bool = False,
-    convert_to_keys: int = 4,
+    convert_to_keys: int | None = None,
 ) -> None:
     log.info("render_start", extra={"osr": str(osr_path), "out": str(output_path)})
 
@@ -1032,7 +1150,7 @@ async def render_mania(
             )
             fr = FrameRenderer(
                 rc, options, skin_dir=skin_dir,
-                beatmap_dir=beatmap_dir,
+                beatmap_dir=beatmap_dir if plan.modded.source_mode == 3 else None,
                 first_note_ms=plan.first_note_ms,
                 # bg dim envelope inputs (dim.py): modded-time note starts +
                 # break periods, and the scroll-speed-scaled approach window.
@@ -1041,6 +1159,7 @@ async def render_mania(
                 approach_ms=plan.effective_approach_ms,
                 # break overlay clock: real/video time -> map time
                 rate=plan.audio_rate,
+                timing_points=plan.timing_points,
             )
             if plan.bg_path and plan.bg_path.exists():
                 fr.set_background(plan.bg_path)

@@ -31,6 +31,10 @@ class HoldNote:
     end_time_ms: int
     hit_sound: int = 0
     hit_sample: HitSample = HitSample()
+    # Native legacy Mania defaults to an empty lazer tail node. A converted
+    # or explicitly supplied node may carry its own sample metadata.
+    tail_hit_sample: HitSample | None = None
+    tail_hit_sound: int = 0
 
     @property
     def duration_ms(self) -> int:
@@ -59,6 +63,13 @@ class TimingPoint:
     # (e.g. 500 → 120 BPM). Carried so the nightcore-hitsounds overlay can
     # know where the beats are without scanning the .osu again.
     beat_length_ms: float = 500.0
+    # Source/presentation metadata; inherited SV and time signatures must not
+    # be lost when constructing stable's movement and measure timelines.
+    time_signature: int = 4
+    raw_beat_length_ms: float | None = None
+    raw_time_ms: float | None = None
+    # Preserve omitted legacy fields separately from an explicit numeric zero.
+    field_count: int = 8
 
 
 @dataclass(frozen=True)
@@ -96,7 +107,7 @@ class BeatmapInfo:
     # Hitsound-related metadata. ``default_sample_set`` is osu!'s sample-set
     # name from [General] (Normal/Soft/Drum); ``timing_points`` is sorted by
     # time_ms and used to look up the active sample state at any moment.
-    default_sample_set: str = "Soft"
+    default_sample_set: str = "Normal"
     timing_points: tuple = ()  # tuple[TimingPoint, ...]
     # OD from `[Difficulty] OverallDifficulty`. Drives lazer-style
     # OD-scaled hit windows in the local judgment classifier.
@@ -105,6 +116,11 @@ class BeatmapInfo:
     # parse (mods.apply_mods rescales them to REAL/video time alongside the
     # notes). Drives the background dim envelope's breaks phase (dim.py).
     breaks: tuple = ()  # tuple[tuple[int, int], ...]
+    # Original .osu mode controls stable skin-source eligibility on converts.
+    source_mode: int = 3
+    format_version: int = 14
+    sample_volume: int = 100
+    custom_samples: int | None = None  # [General] override; None uses the stable version default
 
 
 @dataclass(frozen=True)
@@ -135,6 +151,12 @@ class ReplayInfo:
     # 305 for lazer / Score V2. Drives the HUD running acc, the results-screen
     # acc and the grade. Default 305 = lazer.
     mania_acc_weight: int = 305
+    # Client provenance is independent of score weights and the ScoreV2 mod.
+    # Production parsing sets this from the replay's game version.
+    is_lazer_replay: bool = False
+    # Original frame sequence, including transient same-timestamp transitions.
+    # key_events retains its historical last-mask-per-time presentation contract.
+    ordered_key_events: tuple[KeyEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -231,6 +253,8 @@ class RenderOptions:
     # Audio toggles
     normalize_loudness: bool = True
     audio_fade_out_ms: int = 600
+    # Both this and miss_hitsound must be enabled. Threshold is strict >;
+    # lazer also plays its first nonzero-to-zero combo transition.
     combo_break_sound: bool = True
     combo_break_threshold: int = 20
     # When False, skips the per-note hitsound dub entirely (just the song).
@@ -247,7 +271,7 @@ class RenderOptions:
     # samples play instead.
     beatmap_hitsounds: bool = True
     # Miss / combo-break hitsound (default on): off silences the
-    # combobreak.wav that plays on a break of >= 20 combo.
+    # combobreak sample (compatibility alias for combo_break_sound).
     miss_hitsound: bool = True
     # Combo color source for note tints when an .osk is loaded.
     #   "beatmap" — use Beatmap.colours

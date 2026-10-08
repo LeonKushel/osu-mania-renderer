@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from osu_mania_renderer_v2.beatmap.beatmap import sv_distance_at as _sv_distance_at
 from osu_mania_renderer_v2.beatmap.judgments import JudgmentEvent
 from osu_mania_renderer_v2.beatmap.models import HoldNote, KeyEvent, VisualMods
+from osu_mania_renderer_v2.render.legacy_mania_timing import LegacyManiaTiming
+from osu_mania_renderer_v2.render.legacy_mania_events import LegacyHitLightFact, LegacyLongLightState
 
 # Single-slot identity caches for per-render immutable inputs that the old
 # code re-derived EVERY frame (a full list rebuild per call). Keyed on the
@@ -71,6 +73,41 @@ def build_hold_visual_states(
     return states
 
 
+_HOLD_LIGHT_INTERVALS_CACHE: tuple | None = None
+
+
+def _hold_light_clocks(states, t_ms, key_count):
+    """Presentation intervals from scored hold facts; no key-only activation."""
+    global _HOLD_LIGHT_INTERVALS_CACHE
+    if (_HOLD_LIGHT_INTERVALS_CACHE is None
+            or _HOLD_LIGHT_INTERVALS_CACHE[0] is not states
+            or _HOLD_LIGHT_INTERVALS_CACHE[1] != key_count):
+        columns = [[] for _ in range(key_count)]
+        for (column, note_time), state in states.items():
+            if 0 <= column < key_count:
+                start = max(note_time, state.head_hit_time_ms)
+                stop = state.drop_time_ms if state.drop_time_ms is not None else state.finish_time_ms
+                columns[column].append((start, float("inf") if stop is None else stop))
+        merged = []
+        for intervals in columns:
+            result = []
+            for start, stop in sorted(intervals):
+                if result and start <= result[-1][1]:
+                    result[-1] = (result[-1][0], max(stop, result[-1][1]))
+                else:
+                    result.append((start, stop))
+            merged.append((tuple(v[0] for v in result), tuple(result)))
+        _HOLD_LIGHT_INTERVALS_CACHE = (states, key_count, merged)
+    presses, releases = [-1] * key_count, [-1] * key_count
+    for column, (starts, intervals) in enumerate(_HOLD_LIGHT_INTERVALS_CACHE[2]):
+        index = bisect_right(starts, t_ms) - 1
+        if index >= 0:
+            start, stop = intervals[index]
+            presses[column] = int(t_ms - start)
+            releases[column] = int(t_ms - stop) if t_ms >= stop else -1
+    return presses, releases
+
+
 @dataclass(frozen=True)
 class VisibleNote:
     column: int
@@ -90,6 +127,11 @@ class VisibleNote:
     # Stable masks body + tail at this head's centre; the head is unmasked.
     # After a drop this position moves with the released head.
     hold_clip_head_y_fraction: float | None = None
+    # Presentation clock only: pauses at a factual drop, independent of keys.
+    hold_animation_elapsed_ms: float | None = None
+    end_time_ms: int | None = None
+    hold_hit_time_ms: int | None = None
+    hold_drop_time_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +148,43 @@ class HitErrorEvent:
     offset_ms: float
     judgment: str
     age_ms: int
+
+
+@dataclass(frozen=True)
+class LightingNEvent:
+    column: int
+    judgment: str
+    age_ms: float
+
+
+def lighting_n_events_at(facts: tuple[LegacyHitLightFact, ...], times, t_ms, rate=1):
+    """Visible AddHitLight facts in stable insertion order; never score events."""
+    return tuple(LightingNEvent(fact.column, fact.judgment, (t_ms - fact.time_ms) * rate)
+                 for fact in facts[bisect_right(times, t_ms - 200 / rate):
+                                   bisect_right(times, t_ms)])
+
+
+def sliding_colour_mix(intervals, t_ms):
+    """CCM's 300ms endpoint colours and pSprite's oldest active transform.
+
+    Source reversals start at the authored endpoint. Overlapping transitions
+    retain insertion order: the first still-active colour transform wins.
+    This pure evaluation also reproduces direct seeks without sprite history.
+    """
+    first = max(0, bisect_left(intervals, (t_ms - 300,)) - 1)
+    latest = 0.0
+    for start, stop in intervals[first:]:
+        if start > t_ms:
+            break
+        if start <= t_ms <= start + 300:
+            return (t_ms - start) / 300
+        latest = 1.0
+        if stop > t_ms:
+            break
+        if stop <= t_ms <= stop + 300:
+            return 1.0 - (t_ms - stop) / 300
+        latest = 0.0
+    return latest
 
 
 @dataclass(frozen=True)
@@ -202,6 +281,10 @@ class SceneState:
     # means no release has occurred. Stage-light release presentation uses
     # this exact event-derived age rather than renderer-frame transitions.
     key_release_age_ms: tuple[int, ...] = ()
+    # Snapshot compatibility clocks from frozen-head state. Production stable
+    # LightingL uses legacy_long_lights so later presses can resume independently.
+    hold_light_press_age_ms: tuple[int, ...] = ()
+    hold_light_release_age_ms: tuple[int, ...] = ()
     # Per-column cumulative key-press count up to t_ms (rising edges). Drives
     # the bottom-right key counter (lazer's KeyCounterDisplay).
     key_press_counts: tuple[int, ...] = ()
@@ -213,6 +296,14 @@ class SceneState:
     # overlay's Grade line; scene.grade stays the whole-replay grade the
     # results card shows.
     live_grade: str = "SS"
+    # Independent presentation view; the Argon snapshot is unchanged.
+    legacy_timing: LegacyManiaTiming | None = None
+    legacy_visible_notes: tuple[VisibleNote, ...] | None = None
+    lighting_n_events: tuple[LightingNEvent, ...] | None = None
+    legacy_hold_colour_mix: float = 0.0
+    legacy_long_lights: tuple[LegacyLongLightState, ...] | None = None
+    # Source-factual running maximum; the results-screen max_combo stays header-backed.
+    reconstructed_max_combo: int | None = None
 
 
 def snapshot(
@@ -238,6 +329,7 @@ def snapshot(
     note_times: tuple[int, ...] | None = None,
     max_hold_dur_ms: int = 0,
     hold_visual_states: dict[tuple[int, int], HoldVisualState] | None = None,
+    movement_timeline: LegacyManiaTiming | None = None,
 ) -> SceneState:
     """Return what's on screen at time t_ms.
 
@@ -266,7 +358,9 @@ def snapshot(
     )
     # Cache the current frame's cumulative-distance — it doesn't change
     # within a frame, so compute once and reuse for every note.
-    if use_integration:
+    if movement_timeline is not None:
+        current_cum = movement_timeline.distance_at(t_ms)
+    elif use_integration:
         current_cum = _sv_distance_at(t_ms, timing_points, sv_table)
     else:
         current_cum = 0.0
@@ -274,7 +368,9 @@ def snapshot(
     # CLOSER (smaller SV → larger time window for the same playfield
     # distance). For integration path, use the smallest SV in the
     # table (≥0.05 by parser clamp) as the safe floor.
-    if use_integration:
+    if movement_timeline is not None:
+        horizon = movement_timeline.time_at_distance(current_cum + 480) + 1
+    elif use_integration:
         global _MIN_SV_CACHE
         _msc = _MIN_SV_CACHE
         if _msc is None or _msc[0] is not timing_points:
@@ -314,7 +410,10 @@ def snapshot(
                     continue
             elif t_ms >= n.end_time_ms + MISS_GRACE_MS:
                 continue
-            if use_integration:
+            if movement_timeline is not None:
+                head_y = 1.0 - (movement_timeline.distance_at(n.time_ms) - current_cum) / 480
+                tail_y = 1.0 - (movement_timeline.distance_at(n.end_time_ms) - current_cum) / 480
+            elif use_integration:
                 head_y = _y_integrated(
                     n.time_ms, current_cum, approach_ms,
                     timing_points, sv_table,
@@ -337,7 +436,10 @@ def snapshot(
                 active = state.drop_time_ms is None or t_ms < state.drop_time_ms
                 if not active:
                     unfreeze_time = max(n.time_ms, state.drop_time_ms)
-                    if use_integration:
+                    if movement_timeline is not None:
+                        unfreeze_cum = movement_timeline.distance_at(unfreeze_time)
+                        head_y += (current_cum - unfreeze_cum) / 480
+                    elif use_integration:
                         unfreeze_cum = _sv_distance_at(unfreeze_time, timing_points, sv_table)
                         head_y += (current_cum - unfreeze_cum) / approach_ms
                     else:
@@ -347,9 +449,17 @@ def snapshot(
                 column=n.column, is_hold=True,
                 y_fraction=head_y, head_y_fraction=head_y, tail_y_fraction=tail_y,
                 time_ms=n.time_ms,
+                end_time_ms=n.end_time_ms,
                 hold_head_hit=head_hit, hold_active=active,
                 body_head_y_fraction=body_head_y,
                 hold_clip_head_y_fraction=clip_head_y,
+                hold_animation_elapsed_ms=(
+                    max(0.0, min(t_ms, state.drop_time_ms if state.drop_time_ms is not None
+                                  else t_ms) - max(n.time_ms, state.head_hit_time_ms))
+                    if head_hit else 0.0
+                ),
+                hold_hit_time_ms=state.head_hit_time_ms if state else None,
+                hold_drop_time_ms=state.drop_time_ms if state else None,
             ))
         else:
             attempt_t = consumed.get((n.column, n.time_ms))
@@ -363,7 +473,9 @@ def snapshot(
                 # True miss — scroll past for a moment so it's visible.
                 if n.time_ms < t_ms - MISS_GRACE_MS:
                     continue
-            if use_integration:
+            if movement_timeline is not None:
+                y = 1.0 - (movement_timeline.distance_at(n.time_ms) - current_cum) / 480
+            elif use_integration:
                 y = _y_integrated(
                     n.time_ms, current_cum, approach_ms,
                     timing_points, sv_table,
@@ -377,12 +489,15 @@ def snapshot(
                 time_ms=n.time_ms,
             ))
 
+    hold_presses, hold_releases = _hold_light_clocks(hold_states, t_ms, key_count)
     keys_held = _keys_held_at(key_events, t_ms, key_count)
     return SceneState(
         t_ms=t_ms,
         visible_notes=tuple(visible),
         keys_held=keys_held,
         visual_mods=visual_mods,
+        hold_light_press_age_ms=tuple(hold_presses),
+        hold_light_release_age_ms=tuple(hold_releases),
     )
 
 
