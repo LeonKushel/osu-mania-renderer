@@ -143,6 +143,15 @@ async def probe_encoder(encoder: str, device: str | None) -> str:
 # taiko crf 20 / veryfast, catch crf 23 / veryfast, mania 2500k / medium), so
 # these make the choice settable per run without a code edit:
 #   R3D_X264_PRESET   R3D_X264_CRF   R3D_X264_THREADS   R3D_X264_PARAMS
+# and, for this engine only, R3D_MANIA_X264_PRESET, which wins over
+# R3D_X264_PRESET: the node-wide name moves all four engines at once, and they
+# start from four different presets. What it buys here, at the same bitrate
+# (so the same file size), on the self-test replay against a lossless copy of
+# the same frames, M1 Max, node settings with the inline preview:
+#               720p60                          1080p60
+#   medium      10.4 s  VMAF 97.93 (1%: 96.7)   16.9 s  VMAF 97.77 (1%: 96.5)
+#   faster       8.9 s       97.90 (1%: 96.2)   13.4 s       97.66 (1%: 94.3)
+#   veryfast     8.1 s       97.78 (1%: 95.9)   11.1 s       97.42 (1%: 93.6)
 # THE DEFAULTS REPRODUCE THIS ENGINE'S CURRENT COMMAND EXACTLY (a 2500k bitrate target on x264's default preset, medium):
 # with none of them set the ffmpeg argv is unchanged, argument for argument.
 #
@@ -153,8 +162,8 @@ async def probe_encoder(encoder: str, device: str | None) -> str:
 def _x264_knobs() -> "tuple[str, str, str, str]":
     """(preset, crf, threads, params) from the environment as it is NOW."""
     g = lambda k: os.environ.get(k, "").strip()
-    return (g("R3D_X264_PRESET"), g("R3D_X264_CRF"), g("R3D_X264_THREADS"),
-            g("R3D_X264_PARAMS"))
+    return (g("R3D_MANIA_X264_PRESET") or g("R3D_X264_PRESET"),
+            g("R3D_X264_CRF"), g("R3D_X264_THREADS"), g("R3D_X264_PARAMS"))
 
 
 def nvenc_target_bps(w: int, h: int, fps: float) -> int:
