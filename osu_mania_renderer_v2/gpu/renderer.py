@@ -1052,6 +1052,21 @@ class FrameRenderer:
         """True when NO user skin supplies mania content — the Argon default
         applies (matches wiki_elements._common._skin_provides_mania). Used to
         switch the playfield to lazer's Argon stage-unit geometry."""
+        # Asked ~28 times a frame, and each answer walks ~32 atlas lookups.
+        # It depends only on the [Mania] section, the atlas and the key count,
+        # and an atlas' source tables are written only while it is loaded
+        # (SpriteAtlas.load), so the answer is kept for as long as those three
+        # are the same objects. Replace any of them and it is worked out again.
+        atlas, section, keys = self.atlas, self.mania_section, self.rc.key_count
+        kept = getattr(self, "_argon_default_kept", None)
+        if (kept is not None and kept[0] is atlas and kept[1] is section
+                and kept[2] == keys):
+            return kept[3]
+        value = self._work_out_argon_default()
+        self._argon_default_kept = (atlas, section, keys, value)
+        return value
+
+    def _work_out_argon_default(self) -> bool:
         if self.mania_section is not None:
             return False
         a = self.atlas
