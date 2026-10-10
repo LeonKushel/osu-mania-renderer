@@ -619,6 +619,15 @@ async def build_render_plan(
     if gpu_yuv:
         log.info("gpu_yuv")
 
+    # The inline preview on the Mac's media engine (render/preview_hw.py), as
+    # in std, taiko and catch: only asked about when there is a preview and
+    # the master is on libx264.
+    preview_hw = False
+    if preview_path is not None and encoder == "libx264":
+        from osu_mania_renderer_v2.render.preview_hw import preview_on_media_engine
+        preview_hw = preview_on_media_engine()
+        if preview_hw:
+            log.info("inline_preview_media_engine")
     cmd = build_ffmpeg_cmd(
         frames_yuv420p=gpu_yuv,
         encoder=encoder,
@@ -642,6 +651,7 @@ async def build_render_plan(
         preview_path=preview_path,
         stream_master=stream_master,
         compact_path=compact_path,
+        preview_hw=preview_hw,
     )
 
     bg_filename = modded.background_filename

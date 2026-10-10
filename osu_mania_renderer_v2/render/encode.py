@@ -295,6 +295,7 @@ def build_ffmpeg_cmd(
     stream_master: bool = False,
     compact_path: Path | None = None,
     frames_yuv420p: bool = False,
+    preview_hw: bool = False,
 ) -> list[str]:
     """Build the ffmpeg argv. Audio is optional.
 
@@ -328,6 +329,13 @@ def build_ffmpeg_cmd(
     decided by the caller). When set, the SAME ffmpeg process also writes a
     lean 720p30 libx264 preview there as a second output, so it is finished the
     moment the render is. ``None`` builds the argv exactly as before.
+
+    ``preview_hw`` — encode that preview with VideoToolbox instead of libx264
+    (render/preview_hw.py; the caller passes ``preview_on_media_engine()``).
+    Only taken when the master is on libx264, so the preview's is the only
+    hardware session this process holds, and only when the length is known
+    (the preview's audio must be ended explicitly, see below). The master's
+    arguments are the same either way.
     """
     w, h = resolution
     cmd: list[str] = [*_ffmpeg_prefix(), "-y", "-hide_banner", "-loglevel", "error"]
@@ -618,6 +626,14 @@ def build_ffmpeg_cmd(
         v_pre = ",".join(vf_chain)
         vm_tail = "null"
         vp_tail = f"fps={pfps},scale=-2:720"
+    # Hardware preview: only beside a libx264 master, and only with a known
+    # length. Its first frame is repeated in front for half a second and cut
+    # off again after encoding (preview_hw._vt_codec_args says why).
+    preview_hw = bool(preview_hw and encoder == "libx264"
+                      and total_duration_ms is not None and total_duration_ms > 0)
+    if preview_hw:
+        from osu_mania_renderer_v2.render import preview_hw as _phw
+        vp_tail += "," + _phw.vt_lead_in_filter(pfps)
     if compact_path is not None:
         # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1): a third branch encoded to
         # the compact plan, so nothing is left to encode after the render.
@@ -666,6 +682,13 @@ def build_ffmpeg_cmd(
         else:
             graph.append("[aout]asplit=2[am][ap0];"
                          f"[ap0]aresample,{LOUDNORM}[ap]")
+    if preview_hw and has_audio:
+        # `-t` on the preview output is measured BEFORE the lead-in is cut off,
+        # so below it is the length plus the lead-in, which would let half a
+        # second of extra audio through. End the preview's audio at the
+        # video's length here instead.
+        graph = [g.replace("[ap]", "[ap_full]") for g in graph]
+        graph.append(f"[ap_full]atrim=end={total_duration_ms / 1000:.6f}[ap]")
     cmd += ["-filter_complex", ";".join(graph)]
 
     # output 1: the master, exactly as without the preview (same codec args,
@@ -681,16 +704,21 @@ def build_ffmpeg_cmd(
     cmd += t_args
     cmd += [str(output_path)]
 
-    # output 2: the preview. libx264 on every node, deliberately: a second
-    # NVENC/VAAPI/AMF/QSV session can fail to open (session limits), and one
-    # failed output kills the whole process and with it the render.
+    # output 2: the preview. libx264 unless the caller proved a hardware
+    # session opens here (`preview_hw`): a second NVENC/VAAPI/AMF/QSV session
+    # can fail to open (session limits), and one failed output kills the whole
+    # process and with it the render. On a Mac the master is on libx264, so
+    # the preview's is the only hardware session this process holds.
     vbps = preview_video_bps(
         total_duration_ms / 1000.0 if total_duration_ms else None)
     cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if has_audio else [])
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
-            "-bufsize", str(vbps * 2), "-g", "30",
-            "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+    if preview_hw:
+        cmd += _phw.hw_video_args(vbps, pfps)
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+                "-bufsize", str(vbps * 2), "-g", "30",
+                "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
     # Same BT.709 / limited-range tags as the master: the preview carries the
     # same (already range-converted) pixels, so it must be labelled the same or
     # players would render the two with different matrices.
@@ -703,7 +731,11 @@ def build_ffmpeg_cmd(
     # engine's choice): here the song usually ends a few seconds before the
     # results card does, and `-shortest` would cut the preview there while the
     # master runs on.
-    cmd += t_args
+    if preview_hw:
+        # the same bound, counted before the lead-in is cut off
+        cmd += ["-t", f"{total_duration_ms / 1000 + _phw._vt_lead_frames(pfps) / pfps:.3f}"]
+    else:
+        cmd += t_args
     cmd += _preview_sink_args(preview_path)
     if compact_path is not None:
         # output 3: the Discord copy. Same recipe as the node's own compact
@@ -850,10 +882,22 @@ class FfmpegPipe:
             self._writer = None
             self._q = None
 
+    def _hw_preview_note(self) -> str:
+        """If this ffmpeg carried a hardware preview and died naming
+        VideoToolbox, switch the media engine off for a day on this node
+        (render/preview_hw.py) so the NEXT render does not repeat it."""
+        if not self.proc or not self.proc.returncode:
+            return ""
+        from osu_mania_renderer_v2.render.preview_hw import note_preview_failure
+        if note_preview_failure(list(self.cmd), self._stderr_log or b""):
+            return (" [the preview's hardware encoder is now off for 24 h on "
+                    "this node; the next render uses the CPU preview]")
+        return ""
+
     def _write_error(self) -> EncoderError:
         return EncoderError(
             f"ffmpeg pipe write failed: {self._werr!r}; exit code {self.proc.returncode}:\n"
-            f"{self._stderr_log.decode(errors='replace')[-4096:]}")
+            f"{self._stderr_log.decode(errors='replace')[-4096:]}" + self._hw_preview_note())
 
     async def _finish(self) -> None:
         if self._finished:
@@ -884,6 +928,7 @@ class FfmpegPipe:
             raise EncoderError(
                 f"ffmpeg exit code {self.proc.returncode}: "
                 f"{self._stderr_log.decode(errors='replace')[-4096:]}"
+                + self._hw_preview_note()
             )
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise EncoderError(f"output MP4 missing or empty: {output_path}")
