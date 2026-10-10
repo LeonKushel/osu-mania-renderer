@@ -187,13 +187,14 @@ def _paint(gl, rgb_bottom_up):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("converter", ["YuvConverter", "PackedYuvConverter"])
 @pytest.mark.parametrize("width,height", [(1280, 720), (1920, 1080), (1024, 768), (64, 12)])
-def test_the_shader_pair_is_the_twin(width, height):
+def test_the_shader_pair_is_the_twin(width, height, converter):
     if os.environ.get("RUN_SLOW") != "1":
         pytest.skip("RUN_SLOW=1 to run real GL pixel checks")
     rng = np.random.default_rng(width * 7 + height)
     with _gl(width, height) as gl:
-        conv = Y.YuvConverter(gl.ctx, width, height)
+        conv = getattr(Y, converter)(gl.ctx, width, height)
         for trial in range(3):
             rgb = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
             if trial == 2:                                   # hard edges and stripes
@@ -208,9 +209,39 @@ def test_the_shader_pair_is_the_twin(width, height):
                 f"{width}x{height} trial {trial}: {int(np.count_nonzero(got != want))} samples differ")
 
 
+def test_which_converter_a_size_gets(monkeypatch):
+    """One pass and one read where the height is divisible by four; the
+    three-target converter for any other height, or when asked for."""
+    made = []
+    monkeypatch.setattr(Y, "PackedYuvConverter", lambda ctx, w, h: made.append(("packed", w, h)) or "packed")
+    monkeypatch.setattr(Y, "YuvConverter", lambda ctx, w, h: made.append(("three", w, h)) or "three")
+    monkeypatch.delenv("R3D_MANIA_GPU_YUV_PACKED", raising=False)
+    assert [Y.make_converter(None, w, h) for w, h in ((1280, 720), (1920, 1080), (2560, 1440), (64, 12))] == ["packed"] * 4
+    assert Y.make_converter(None, 64, 14) == "three"          # even, not divisible by four
+    for v, want in (("0", "three"), ("off", "three"), ("1", "packed")):
+        monkeypatch.setenv("R3D_MANIA_GPU_YUV_PACKED", v)
+        assert Y.make_converter(None, 1280, 720) == want, v
+
+
 @pytest.mark.slow
+def test_the_one_pass_converter_refuses_a_height_it_cannot_lay_out():
+    if os.environ.get("RUN_SLOW") != "1":
+        pytest.skip("RUN_SLOW=1 to run real GL pixel checks")
+    with _gl(64, 14) as gl:
+        with pytest.raises(ValueError):
+            Y.PackedYuvConverter(gl.ctx, 64, 14)
+        conv = Y.make_converter(gl.ctx, 64, 14)
+        assert isinstance(conv, Y.YuvConverter)
+        rgb = np.random.default_rng(1).integers(0, 256, (14, 64, 3), dtype=np.uint8)
+        _paint(gl, rgb)
+        conv.run(gl.fbo.color_attachments[0])
+        assert np.array_equal(np.frombuffer(bytes(conv.read_bytes()), np.uint8), Y.rgb_to_yuv420p(rgb))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("converter", ["YuvConverter", "PackedYuvConverter"])
 @pytest.mark.parametrize("mapped", [True, False])
-def test_the_frame_reader_hands_out_converted_frames_with_its_usual_lag(mapped, monkeypatch):
+def test_the_frame_reader_hands_out_converted_frames_with_its_usual_lag(mapped, converter, monkeypatch):
     if os.environ.get("RUN_SLOW") != "1":
         pytest.skip("RUN_SLOW=1 to run real GL pixel checks")
     from osu_mania_renderer_v2.gpu import readback
@@ -223,7 +254,7 @@ def test_the_frame_reader_hands_out_converted_frames_with_its_usual_lag(mapped, 
     frames = [rng.integers(0, 256, (height, width, 3), dtype=np.uint8) for _ in range(n)]
     with _gl(width, height) as gl:
         reader = readback.FrameReader(gl.ctx, gl.fbo, components=3,
-                                      yuv=Y.YuvConverter(gl.ctx, width, height))
+                                      yuv=getattr(Y, converter)(gl.ctx, width, height))
         assert reader.frame_size == width * height * 3 // 2
         out = []
         for rgb in frames:
@@ -313,12 +344,15 @@ def test_reader_for_plan_picks_by_the_plan(monkeypatch):
     monkeypatch.setattr(readback, "FrameReader",
                         lambda ctx, fbo, components=3, yuv=None: ("reader", yuv))
     assert readback.reader_for_plan(None, _Fbo(), gpu_yuv=False) == ("reader", None)
+    # whichever converter the size gets (make_converter), the reader carries it
     monkeypatch.setattr(Y, "YuvConverter", lambda ctx, w, h: ("converter", w, h))
+    monkeypatch.setattr(Y, "PackedYuvConverter", lambda ctx, w, h: ("converter", w, h))
     assert readback.reader_for_plan(None, _Fbo(), gpu_yuv=True) == ("reader", ("converter", 64, 12))
 
     def boom(ctx, w, h):
         raise RuntimeError("no passes here")
     monkeypatch.setattr(Y, "YuvConverter", boom)
+    monkeypatch.setattr(Y, "PackedYuvConverter", boom)
     fallback = readback.reader_for_plan(None, _Fbo(), gpu_yuv=True)
     assert isinstance(fallback, Y.CpuTwinReader) and fallback.frame_size == 64 * 12 * 3 // 2
 

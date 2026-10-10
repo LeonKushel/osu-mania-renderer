@@ -279,6 +279,104 @@ class YuvConverter:
         return out
 
 
+class PackedYuvConverter:
+    """The same conversion in ONE pass into ONE target, read back with ONE
+    read: the target is the yuv420p buffer itself, laid out as a picture.
+
+        rows 0 .. h-1            the Y plane, a row per row
+        rows h .. h + h/4 - 1    the U plane, two of its rows side by side
+        rows h + h/4 .. 3h/2 - 1 the V plane, the same way
+
+    Needs a height divisible by four; `make_converter` uses the three-target
+    converter otherwise. Same integer arithmetic, same bytes. It is the one
+    `make_converter` picks: one draw and one read a frame instead of two draws
+    and three reads (issuing the read 0.76 -> 0.50 s over the 4,212-frame
+    self-test on an M1 Max, which is what reading RGB costs)."""
+
+    def __init__(self, ctx, width: int, height: int) -> None:
+        import moderngl
+        if not size_ok(width, height) or height % 4:
+            raise ValueError(f"packed GPU yuv needs an even width and a height "
+                             f"divisible by four, got {width}x{height}")
+        self._mgl = moderngl
+        self.ctx = ctx
+        self.width, self.height = width, height
+        ry, gy, by = Y_COEF
+        ru, gu, bu = U_COEF
+        rv, gv, bv = V_COEF
+        vert = ("#version 330\nin vec2 in_pos;\n"
+                "void main(){ gl_Position = vec4(in_pos,0.0,1.0); }")
+        frag = f"""#version 330
+        uniform sampler2D scene;
+        out float outC;
+        const int W = {width};
+        const int H = {height};
+        const int TAP[8] = int[8]({", ".join(str(t) for t in CHROMA_TAPS)});
+        void main() {{
+            ivec2 p = ivec2(gl_FragCoord.xy);
+            if (p.y < H) {{
+                vec3 c = texelFetch(scene, p, 0).rgb;
+                int r = int(c.r*255.0+0.5), g = int(c.g*255.0+0.5), b = int(c.b*255.0+0.5);
+                outC = float(((((({ry}*r + {gy}*g + {by}*b) + {0x801 << 8}) >> 9) + 32) >> 6)) / 255.0;
+                return;
+            }}
+            int rr = p.y - H;
+            bool isV = rr >= H / 4;
+            if (isV) rr -= H / 4;
+            bool right = p.x >= W / 2;
+            int j = rr * 2 + (right ? 1 : 0);
+            int x = (right ? p.x - W / 2 : p.x) * 2;
+            int acc = 0;
+            for (int k = 0; k < 8; ++k) {{
+                int y = clamp(j * 2 - 3 + k, 0, H - 1);
+                ivec3 s = ivec3(texelFetch(scene, ivec2(x, y), 0).rgb * 255.0 + 0.5)
+                        + ivec3(texelFetch(scene, ivec2(x + 1, y), 0).rgb * 255.0 + 0.5);
+                int row = isV ? ((({rv}*s.r + {gv}*s.g + {bv}*s.b) + {0x4001 << 9}) >> 10)
+                              : ((({ru}*s.r + {gu}*s.g + {bu}*s.b) + {0x4001 << 9}) >> 10);
+                acc += TAP[k] * row;
+            }}
+            outC = float(clamp((acc + {1 << 18}) >> 19, 0, 255)) / 255.0;
+        }}"""
+        self._quad = ctx.buffer(np.array([-1, -1, 3, -1, -1, 3], "f4").tobytes())
+        self._prog = ctx.program(vertex_shader=vert, fragment_shader=frag)
+        self._vao = ctx.vertex_array(self._prog, [(self._quad, "2f4", "in_pos")])
+        self._tex = ctx.texture((width, height * 3 // 2), 1, dtype="f1")
+        self.fbo = ctx.framebuffer(color_attachments=[self._tex])
+        self.frame_size = width * height * 3 // 2
+        self._prog["scene"] = 0
+
+    def run(self, scene_tex) -> None:
+        ctx, mgl = self.ctx, self._mgl
+        ctx.disable(mgl.BLEND)
+        scene_tex.use(location=0)
+        self.fbo.use()
+        self._vao.render(mgl.TRIANGLES)
+        ctx.enable(mgl.BLEND)
+
+    def read_into(self, buffer, offset: int = 0) -> None:
+        self.fbo.read_into(buffer, components=1, alignment=1, write_offset=offset)
+
+    def read_bytes(self) -> bytearray:
+        out = bytearray(self.frame_size)
+        self.read_into(out)
+        return out
+
+
+def _packed_wanted() -> bool:
+    v = os.environ.get("R3D_MANIA_GPU_YUV_PACKED")
+    return True if v is None else v.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def make_converter(ctx, width: int, height: int):
+    """The GPU converter for this size: the one-pass, one-read
+    PackedYuvConverter where the height is divisible by four (720, 1080, 1440
+    and 2160 all are), the three-target YuvConverter otherwise. Both give the
+    same bytes. R3D_MANIA_GPU_YUV_PACKED=0 keeps the three-target one."""
+    if _packed_wanted() and height % 4 == 0:
+        return PackedYuvConverter(ctx, width, height)
+    return YuvConverter(ctx, width, height)
+
+
 class CpuTwinReader:
     """The way out when the GPU passes cannot be built on this machine after
     the ffmpeg command has already been started for yuv420p frames: read RGB

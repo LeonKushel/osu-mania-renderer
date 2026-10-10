@@ -336,10 +336,11 @@ def reader_for_plan(ctx: moderngl.Context, fbo: moderngl.Framebuffer, *,
     CPU with the same arithmetic: late, not lost."""
     if not gpu_yuv:
         return FrameReader(ctx, fbo, components=3)
-    from osu_mania_renderer_v2.gpu.yuv import CpuTwinReader, YuvConverter
+    from osu_mania_renderer_v2.gpu import yuv as _yuv
+    CpuTwinReader = _yuv.CpuTwinReader
     w, h = fbo.size
     try:
-        return FrameReader(ctx, fbo, components=3, yuv=YuvConverter(ctx, w, h))
+        return FrameReader(ctx, fbo, components=3, yuv=_yuv.make_converter(ctx, w, h))
     except Exception as e:  # noqa: BLE001
         log.warning("gpu_yuv_unavailable_cpu_twin", extra={"err": str(e)})
         return CpuTwinReader(FrameReader(ctx, fbo, components=3), w, h)
