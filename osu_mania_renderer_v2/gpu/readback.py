@@ -57,14 +57,13 @@ _LEASE_TIMEOUT_S = 30.0
 # it"). A readback buffer is the opposite: the GPU writes it and the
 # application reads it once, which is GL_STREAM_READ.
 #
-# On macOS the hint decides where a map's cost is paid. With DYNAMIC_DRAW
-# every glMapBufferRange brought the frame across before it returned: 0.6 ms
-# a frame at 1280x720 on the draw thread (2.6 s of a 70 s replay), with the
-# GPU already finished (a fence on the read was signalled every time). With
-# STREAM_READ the map returns at once and the bytes are paid for where they
-# are first read, which is the ffmpeg writer thread, beside the drawing
-# instead of in front of it. Same bytes either way; only the usage hint of
-# the pool changes.
+# On macOS the hint decides what a map costs. With DYNAMIC_DRAW every
+# glMapBufferRange took 0.6 ms a frame at 1280x720 on the draw thread (2.6 s
+# of a 70 s replay), with the GPU already finished (a fence on the read was
+# signalled every time). With STREAM_READ the map returns at once, and
+# reading the mapped bytes afterwards is cheap as well (0.03 ms a frame): the
+# time was the map call itself, not the bytes. Same bytes either way; only
+# the usage hint of the pool changes.
 #
 # On by default on macOS, where that was measured. Anywhere else it is off
 # until it has been measured there; R3D_MANIA_STREAM_READ=1 / =0 forces it.
